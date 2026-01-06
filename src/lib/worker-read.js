@@ -10,6 +10,9 @@ const db = new Database(workerData.filename, { readonly: true });
 db.pragma("busy_timeout = 5000");
 db.defaultSafeIntegers(true);
 
+// SIGNAL READY: Tell main thread we are up and running
+parentPort.postMessage({ status: 'ready' });
+
 // Store active iterators for streaming
 const activeStreams = new Map();
 

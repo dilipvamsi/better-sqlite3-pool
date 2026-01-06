@@ -17,6 +17,9 @@ db.pragma("busy_timeout = 5000");
 // Always read BigInts initially. Main thread handles casting.
 db.defaultSafeIntegers(true);
 
+// SIGNAL READY: Tell main thread the file exists
+parentPort.postMessage({ status: 'ready' });
+
 parentPort.on(
   "message",
   ({ id, action, sql, params, options, fnName, fnString }) => {

@@ -52,6 +52,15 @@ class Database extends EventEmitter {
     this._initPragmas = [];
     this._initFunctions = [];
 
+    // FLAG: Is the writer ready?
+    this.writerReady = false;
+
+    // Create a Promise that resolves when the DB is created, or rejects if it fails.
+    this.writerReadyPromise = new Promise((resolve, reject) => {
+      this._resolveWriterReady = resolve;
+      this._rejectWriterReady = reject;
+    });
+
     // Writer (Single Thread, Serialized)
     this.writer = new Worker(path.resolve(__dirname, "lib/worker-write.js"), {
       workerData: { filename },
@@ -60,7 +69,36 @@ class Database extends EventEmitter {
     this.writeId = 0;
 
     // Bind Messaging
-    this.writer.on("message", (msg) => this._handleMsg(this.writeQueue, msg));
+    // 1. Handle Ready Signal
+    this.writer.on("message", (msg) => {
+      if (msg.status === "ready") {
+        this.writerReady = true;
+        if (this._resolveWriterReady) this._resolveWriterReady();
+
+        // Only now can we safely spawn initial readers
+        if (!this.memory) {
+          this._initReaders();
+        }
+        return;
+      }
+      this._handleMsg(this.writeQueue, msg);
+    });
+
+    // 2. Handle Startup Errors (Critical for preventing hangs)
+    this.writer.on("error", (err) => {
+      const error = createError(err);
+
+      // If we crashed before being ready, reject the init promise
+      if (!this.writerReady && this._rejectWriterReady) {
+        this._rejectWriterReady(error);
+      }
+
+      // Also flush any pending Reads that were waiting in the queue for init
+      if (this.readQueue && this.readQueue.length > 0) {
+        this.readQueue.forEach((task) => task.reject(error));
+        this.readQueue.length = 0;
+      }
+    });
 
     // Bind Error Handling (CRITICAL FIX)
     this._bindWorkerEvents(this.writer, this.writeQueue);
@@ -71,11 +109,6 @@ class Database extends EventEmitter {
     this.readers = [];
     this.readQueue = [];
 
-    // Only init readers if NOT in memory mode
-    if (!this.memory) {
-      this._initReaders();
-    }
-
     this._inTransaction = false;
   }
 
@@ -84,17 +117,54 @@ class Database extends EventEmitter {
   }
 
   /**
-   * Register a UDF (User Defined Function).
-   * Broadcasts to all current and future workers.
+   * Helper: Waits for Writer and ALL currently booting readers to be ready.
    */
-  function(name, fn) {
+  async _waitForInitialization() {
+    // 1. Wait for Writer
+    if (!this.writerReady) {
+      await this.writerReadyPromise;
+    }
+
+    // 2. Wait for any booting Readers
+    // We filter for readers that exist but haven't flagged 'ready' yet.
+    const pendingReaders = this.readers
+      .filter((r) => !r.ready && r.readyPromise)
+      .map((r) => r.readyPromise);
+
+    if (pendingReaders.length > 0) {
+      await Promise.all(pendingReaders);
+    }
+  }
+
+  /**
+   * Register a User Defined Function.
+   * Safe to call before database is ready.
+   */
+  async function(name, fn) {
+    // 1. Validate Input
+    if (typeof name !== "string")
+      throw new TypeError("Expected first argument to be a string");
+    if (typeof fn !== "function")
+      throw new TypeError("Expected second argument to be a function");
+
+    // Wait for infrastructure
+    await this._waitForInitialization();
+
+    // 2. Persist for future workers
     const fnString = fn.toString();
     this._initFunctions.push({ name, fnString });
 
     const payload = { action: "function", fnName: name, fnString, id: -1 };
-    this.writer.postMessage(payload);
-    this.readers.forEach((r) => r.worker.postMessage(payload));
 
+    // 3. Send to Writer ONLY if ready (otherwise replayed in 'ready' event)
+    if (this.writerReady) {
+      this.writer.postMessage(payload);
+    }
+
+    // 4. Send to Readers (Node buffers messages, so this is generally safe)
+    if (this.readers.length > 0) {
+      this.readers.forEach((r) => r.worker.postMessage(payload));
+    }
     return this;
   }
 
@@ -102,6 +172,9 @@ class Database extends EventEmitter {
    * Execute a Pragma. Broadcasts to all workers.
    */
   async pragma(sql, options = {}) {
+    // Wait for infrastructure
+    await this._waitForInitialization();
+
     this._initPragmas.push(sql);
 
     // Send to Writer (Await)
@@ -121,38 +194,53 @@ class Database extends EventEmitter {
 
   /**
    * Dynamically increases the size of the reader pool.
+   * Waits for Writer to be ready, then spawns readers and waits for them to be ready.
    * New values must be greater than or equal to current settings.
    * @param {number} min - New minimum readers (must be >= current min)
    * @param {number} max - New maximum readers (must be >= current max)
    */
-  pool(min, max) {
+  async pool(min, max) {
     if (this.memory) return;
 
     if (!Number.isInteger(min) || min < 0)
-      throw new Error("min must be a positive integer");
+      throw new TypeError("min must be a positive integer");
     if (!Number.isInteger(max) || max < 0)
-      throw new Error("max must be a positive integer");
-    if (min > max) throw new Error("min cannot be greater than max");
+      throw new TypeError("max must be a positive integer");
+    if (min > max) throw new RangeError("min cannot be greater than max");
 
-    // --- VALIDATION: Ensure we only Scale Up ---
-    // This guarantees we never need to shrink, preserving active workers.
-    if (min < this.minReaders) {
-      throw new Error(
+    // Scale Up Only Validation
+    if (min < this.minReaders)
+      throw new RangeError(
         `New min (${min}) cannot be smaller than current min (${this.minReaders})`
       );
-    }
-    if (max < this.maxReaders) {
-      throw new Error(
+    if (max < this.maxReaders)
+      throw new RangeError(
         `New max (${max}) cannot be smaller than current max (${this.maxReaders})`
       );
-    }
+
+    // Use common helper
+    await this._waitForInitialization();
 
     this.minReaders = min;
     this.maxReaders = max;
 
-    // Grow: Check if we are below the new min and spawn immediately
+    // 1. Wait for Writer (if not ready)
+    if (!this.writerReady) {
+      await this.writerReadyPromise;
+    }
+
+    // 2. Spawn Readers and collect their ready promises
+    const startupPromises = [];
     while (this.readers.length < this.minReaders) {
-      this._spawnReader();
+      const reader = this._spawnReader();
+      if (reader && reader.readyPromise) {
+        startupPromises.push(reader.readyPromise);
+      }
+    }
+
+    // 3. Wait for all new readers to be fully operational
+    if (startupPromises.length > 0) {
+      await Promise.all(startupPromises);
     }
   }
 
@@ -172,7 +260,6 @@ class Database extends EventEmitter {
       workerData: { filename: this.filename },
     });
 
-    // Replay State
     for (const sql of this._initPragmas)
       worker.postMessage({ action: "exec", sql: `PRAGMA ${sql}`, id: -1 });
     for (const udf of this._initFunctions)
@@ -183,15 +270,30 @@ class Database extends EventEmitter {
         id: -1,
       });
 
+    // Setup Reader object with a Ready Promise
+    let resolveReady, rejectReady;
+    const readyPromise = new Promise((res, rej) => {
+      resolveReady = res;
+      rejectReady = rej;
+    });
+
     const reader = {
       id: Date.now() + Math.random(),
       worker,
       busy: false,
+      ready: false, // FLAG: Is this reader fully initialized?
       queue: new Map(),
+      readyPromise, // Expose promise for pool() to await
     };
 
-    // Bind Messaging
     worker.on("message", (msg) => {
+      if (msg.status === "ready") {
+        reader.ready = true;
+        if (resolveReady) resolveReady();
+        // Flush any tasks that were assigned to this reader while it was booting
+        this._drainSpecificReaderQueue(reader);
+        return;
+      }
       if (msg.status !== "stream_data") {
         this._handleMsg(reader.queue, msg);
         reader.busy = false;
@@ -199,10 +301,29 @@ class Database extends EventEmitter {
       }
     });
 
-    // Bind Error Handling (CRITICAL FIX)
+    // Hook up rejection logic for startup failures
+    worker.on("error", (err) => {
+      if (!reader.ready && rejectReady) rejectReady(createError(err));
+      this._cleanupWorker(reader.queue, err, reader);
+    });
+    worker.on("exit", (code) => {
+      if (!reader.ready && code !== 0 && rejectReady)
+        rejectReady(new Error(`Worker exited with code ${code}`));
+      if (code !== 0)
+        this._cleanupWorker(
+          reader.queue,
+          new Error(`Worker exited with code ${code}`),
+          reader
+        );
+    });
+
     this._bindWorkerEvents(worker, reader.queue, reader);
 
     this.readers.push(reader);
+
+    // Check for pending work
+    this._drainReadQueue();
+
     return reader;
   }
 
@@ -258,6 +379,10 @@ class Database extends EventEmitter {
   }
 
   async _requestWrite(action, sqlOrPayload, params) {
+    // Strictly wait for DB initialization before attempting writes
+    if (!this.writerReady) {
+      await this.writerReadyPromise;
+    }
     // Unpack payload
     const isObj = typeof sqlOrPayload === "object" && sqlOrPayload !== null;
     const sql = isObj ? sqlOrPayload.sql : sqlOrPayload;
@@ -277,7 +402,17 @@ class Database extends EventEmitter {
     }
   }
 
-  _requestRead(action, sqlOrPayload, params) {
+  async _requestRead(action, sqlOrPayload, params) {
+    if (this.memory) {
+      // Delegates to _requestWrite, which now handles waiting for init
+      return this._requestWrite(action, sqlOrPayload, params);
+    }
+
+    // 1. Wait for Global DB Init (Writer)
+    if (!this.writerReady) {
+      await this.writerReadyPromise;
+    }
+
     return new Promise((resolve, reject) => {
       const isObj = typeof sqlOrPayload === "object" && sqlOrPayload !== null;
       const sql = isObj ? sqlOrPayload.sql : sqlOrPayload;
@@ -294,10 +429,26 @@ class Database extends EventEmitter {
     });
   }
 
-  _execRead(reader, task) {
+  /**
+   * Executes a read task on a specific reader.
+   * WAITS for the reader to be fully 'ready' before sending the message.
+   */
+  async _execRead(reader, task) {
     reader.busy = true;
     const id = Math.random();
     reader.queue.set(id, task);
+
+    // Wait for this specific reader to finish booting
+    if (!reader.ready) {
+      try {
+        await reader.readyPromise;
+      } catch (err) {
+        // If reader failed init, _cleanupWorker handles the queue rejection.
+        // We just stop here to prevent posting to a dead worker.
+        return;
+      }
+    }
+
     reader.worker.postMessage({
       id,
       action: task.action,
@@ -305,6 +456,14 @@ class Database extends EventEmitter {
       params: task.params,
       options: task.options,
     });
+  }
+
+  // Helper to drain the main queue into a specific reader (used when a specific reader becomes ready)
+  _drainSpecificReaderQueue(reader) {
+    if (!this.readQueue.length || reader.busy) return;
+    // We grab one task from the global queue and assign it to this specific newly-ready reader
+    const task = this.readQueue.shift();
+    if (task) this._execRead(reader, task);
   }
 
   _drainReadQueue() {

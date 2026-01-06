@@ -9,26 +9,32 @@ declare module "better-sqlite3-pool" {
     constructor(filename: string, options?: Database.Options);
 
     prepare(sql: string): Database.Statement;
+
     exec(sql: string): Promise<void>;
 
     /** Dynamically resize the reader pool. */
-    pool(min: number, max: number): void;
+    pool(min: number, max: number): Promise<void>;
 
     /** execute a PRAGMA. Broadcasts to all workers. */
     pragma(sql: string, options?: { simple?: boolean }): Promise<any>;
 
     /** Register a User Defined Function. Broadcasts to all workers. */
-    function(name: string, fn: (...args: any[]) => any): this;
+    function(name: string, fn: (...args: any[]) => any): Promise<this>;
 
     close(): Promise<void>;
+
+    /** The SQLiteError class used by this database */
+    static SqliteError: typeof Database.SqliteError;
+    /** The Statement class used by this database */
+    static Statement: typeof Database.Statement;
   }
 
   // 2. The Namespace (For inner types and classes)
   namespace Database {
     export interface Options {
-      /** Minimum number of reader workers (default: 1) */
+      /** Minimum number of reader workers (default: 2) */
       min?: number;
-      /** Maximum number of reader workers (default: 2) */
+      /** Maximum number of reader workers (default: 8) */
       max?: number;
     }
 
@@ -59,15 +65,13 @@ declare module "better-sqlite3-pool" {
     }
   }
 
-  // 3. The Export Assignment (Matches module.exports = Database)
+  // 3. The Export Assignment
   export = Database;
 }
 
 declare module "better-sqlite3-pool/adapter" {
-  // Import the main Database class to type the 'db' field
   import MainDatabase = require("better-sqlite3-pool");
 
-  // It defines the metadata returned after an INSERT/UPDATE/DELETE.
   export interface RunResult {
     changes: number;
     lastID: number | bigint;
@@ -76,14 +80,12 @@ declare module "better-sqlite3-pool/adapter" {
   export class Database {
     /** Access the underlying better-sqlite3-pool instance */
     readonly db: MainDatabase;
+
     constructor(
       filename: string,
       mode?: number,
       callback?: (err: Error | null) => void
     );
-
-    // It is used as the 'this' context in the callback for run().
-    // We explicitly type 'this' so TypeScript knows about .lastID and .changes
 
     run(
       sql: string,
@@ -96,7 +98,6 @@ declare module "better-sqlite3-pool/adapter" {
       callback?: (this: RunResult, err: Error | null) => void
     ): void;
 
-    // 'all' (SELECT) uses a second argument 'rows', not 'this' context.
     all(sql: string, callback?: (err: Error | null, rows: any[]) => void): void;
     all(
       sql: string,
@@ -107,6 +108,5 @@ declare module "better-sqlite3-pool/adapter" {
     close(callback?: (err: Error | null) => void): void;
   }
 
-  // Shim for compatibility
   export function verbose(): any;
 }

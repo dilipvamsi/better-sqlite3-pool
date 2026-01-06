@@ -63,19 +63,29 @@ function deserializeFunction(fnString) {
  * @returns {Error}
  */
 function createError(errPayload) {
-  if (errPayload && typeof errPayload === "object") {
-    // If it has a SQLITE code, create a strict SqliteError
-    if (
-      errPayload.code &&
-      typeof errPayload.code === "string" &&
-      errPayload.code.startsWith("SQLITE_")
-    ) {
-      return new SqliteError(errPayload.message, errPayload.code);
-    }
-    // Otherwise generic Error (e.g. TypeError in worker)
-    return new Error(errPayload.message || "Unknown Worker Error");
+  // 1. If it's already a SqliteError (e.g. caught locally), return it as-is.
+  if (errPayload instanceof SqliteError) {
+    return errPayload;
   }
-  return new Error(String(errPayload));
+
+  // 2. If it's a standard Error object (local), return it as-is.
+  if (errPayload instanceof Error) {
+    return errPayload;
+  }
+
+  // 3. Worker Payload (Structured Clone) handling
+  // Fallback to string if message is undefined (fixes "SqliteError: undefined")
+  const msg =
+    (errPayload && errPayload.message) ||
+    String(errPayload || "Unknown Worker Error");
+
+  const code = errPayload && errPayload.code;
+
+  if (code && typeof code === "string" && code.startsWith("SQLITE_")) {
+    return new SqliteError(msg, code);
+  }
+
+  return new Error(msg);
 }
 
 module.exports = { castRow, deserializeFunction, createError };
