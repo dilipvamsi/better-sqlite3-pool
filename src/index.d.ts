@@ -6,7 +6,7 @@
 declare module "better-sqlite3-pool" {
   // 1. The Class Definition
   class Database {
-    constructor(filename: string, options?: Database.Options);
+    create(filename: string, options?: Database.Options): Promise<Database>;
 
     prepare(sql: string): Database.Statement;
 

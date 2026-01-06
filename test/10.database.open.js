@@ -18,7 +18,7 @@ describe("new Database()", function () {
 
   it("should allow disk-bound databases to be created", async function () {
     const filename = nextFile();
-    this.db = new Database(filename);
+    this.db = await Database.create(filename);
 
     // Check instance type
     expect(this.db).to.be.an.instanceof(Database);
@@ -29,14 +29,14 @@ describe("new Database()", function () {
   });
 
   it("should allow in-memory databases to be created", async function () {
-    this.db = new Database(":memory:");
+    this.db = await Database.create(":memory:");
     const result = await this.db.prepare("SELECT 1 as val").get();
     expect(result.val).to.equal(1);
   });
 
-  it("should accept pool options (min/max)", function () {
+  it("should accept pool options (min/max)", async function () {
     const filename = nextFile();
-    this.db = new Database(filename, { min: 1, max: 4 });
+    this.db = await Database.create(filename, { min: 1, max: 4 });
 
     // Verify internal state (specific to your implementation)
     expect(this.db.minReaders).to.equal(1);
@@ -44,9 +44,9 @@ describe("new Database()", function () {
     expect(this.db.readers).to.be.an("array");
   });
 
-  it("should have a proper prototype chain", function () {
+  it("should have a proper prototype chain", async function () {
     const filename = nextFile();
-    this.db = new Database(filename);
+    this.db = await Database.create(filename);
 
     expect(this.db).to.be.an.instanceof(Database);
     expect(this.db.constructor).to.equal(Database);
@@ -62,7 +62,7 @@ describe("new Database()", function () {
     }
 
     const filename = nextFile();
-    this.db = new MyDatabase(filename);
+    this.db = await MyDatabase.create(filename);
 
     expect(this.db).to.be.an.instanceof(Database);
     expect(this.db).to.be.an.instanceof(MyDatabase);
@@ -73,22 +73,22 @@ describe("new Database()", function () {
     expect(result.val).to.equal(1);
   });
 
-  it("should not throw synchronously on invalid paths (errors happen in workers)", function () {
+  it("should not throw synchronously on invalid paths (errors happen in workers)", async function () {
     // Unlike better-sqlite3, your constructor only sets up threads.
     // File errors happen async inside the worker.
     const filepath = `temp/nonexistent/dir/${Date.now()}.db`;
 
     // This should NOT throw synchronously
-    this.db = new Database(filepath);
-    expect(this.db).to.be.an.instanceof(Database);
+    Database.create(filepath).catch((err) =>
+      expect(err).to.be.instanceof(TypeError),
+    );
   });
 
   it("should propagate worker errors when executing queries", async function () {
     const filepath = `temp/nonexistent/dir/${Date.now()}.db`;
-    this.db = new Database(filepath);
-
     // The error should appear when we try to use the DB
     try {
+      this.db = await Database.create(filepath);
       await this.db.prepare("SELECT 1").get();
       throw new Error("Should have failed");
     } catch (err) {
@@ -100,7 +100,7 @@ describe("new Database()", function () {
   });
 
   it("should behave correctly as a single-threaded instance for :memory: databases", async function () {
-    this.db = new Database(":memory:");
+    this.db = await Database.create(":memory:");
 
     // 1. Verify readers are 0
     expect(this.db.readers.length).to.equal(0);

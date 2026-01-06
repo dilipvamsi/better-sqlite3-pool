@@ -80,6 +80,11 @@ const { createError } = require("./utils");
 // =============================================================================
 
 /**
+ * Internal Symbol to prevent direct constructor usage.
+ */
+const kInternal = Symbol("DatabaseInternal");
+
+/**
  * @class Database
  * @extends EventEmitter
  * @description The main Database class that acts as a connection pool manager.
@@ -88,14 +93,43 @@ const { createError } = require("./utils");
  */
 class Database extends EventEmitter {
   /**
+   * Asynchronously creates and initializes a new Database connection pool.
+   * This method spawns workers and waits for the database file to be ready.
+   *
+   * @param {string} filename - Path to the SQLite database file (or ':memory:').
+   * @param {Object} [options] - Configuration options.
+   * @param {number} [options.min=2] - Minimum number of reader workers to keep alive.
+   * @param {number} [options.max=8] - Maximum number of reader workers allowed.
+   * @returns {Promise<Database>} A fully initialized Database instance.
+   */
+  static async create(filename, options = {}) {
+    const db = new this(filename, options, kInternal);
+    try {
+      await db.ready();
+      return db;
+    } catch (err) {
+      await db.close();
+      throw err;
+    }
+  }
+
+  /**
    * Create a new Database connection pool.
    * @param {string} filename - Path to the SQLite database file (or ':memory:').
    * @param {Object} [options] - Configuration options.
    * @param {number} [options.min=2] - Minimum number of reader workers to keep alive.
    * @param {number} [options.max=8] - Maximum number of reader workers allowed.
+   * @param {Symbol} [token] - Internal token to prevent public usage.
    * @throws {TypeError|RangeError} If options are invalid.
    */
-  constructor(filename, options = {}) {
+  constructor(filename, options = {}, token) {
+    if (token !== kInternal) {
+      throw new Error(
+        "Direct constructor usage is not supported. Use 'await Database.create(filename, options)' instead.",
+      );
+    }
+    if (typeof filename != "string")
+      throw new TypeError("filename has to be string");
     super();
     this.filename = filename;
     this.options = options;
@@ -276,9 +310,6 @@ class Database extends EventEmitter {
     if (typeof fn !== "function")
       throw new TypeError("Expected second argument to be a function");
 
-    // Ensure infrastructure is up before broadcasting
-    await this._waitForInitialization();
-
     const fnString = fn.toString();
     this._initFunctions.push({ name, fnString });
     const payload = { action: "function", fnName: name, fnString };
@@ -302,8 +333,6 @@ class Database extends EventEmitter {
    * @returns {Promise<any>} The result of the PRAGMA execution.
    */
   async pragma(sql, options = {}) {
-    await this._waitForInitialization();
-
     this._initPragmas.push(sql);
     const payload = { action: "exec", sql: `PRAGMA ${sql}` };
 
@@ -361,9 +390,6 @@ class Database extends EventEmitter {
 
     this.minReaders = min;
     this.maxReaders = max;
-
-    // Ensure we don't scale before the DB exists
-    await this._waitForInitialization();
 
     // Spawn new readers if necessary
     const startupPromises = [];
@@ -698,8 +724,6 @@ class Database extends EventEmitter {
     if (this.memory) {
       return this._requestWrite(action, sqlOrPayload, params);
     }
-
-    await this._waitForInitialization();
 
     // CRITICAL FIX: Check if we are still open after waiting
     if (!this.open || !this.writer) {
