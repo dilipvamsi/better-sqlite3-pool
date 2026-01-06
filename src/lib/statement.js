@@ -32,7 +32,7 @@ const { castRow } = require("./utils");
 
  /**
  * We import the Database class definition from the parent module.
- * @typedef {import('../database'.Database)} Database
+ * @typedef {import('./database'.Database)} Database
  */ 
 
 // =============================================================================

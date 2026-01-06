@@ -5,7 +5,7 @@
  * the thread-safety and performance benefits of the worker pool.
  */
 
-const { Database } = require("./database");
+const { Database } = require("./lib/database");
 
 // =============================================================================
 // TYPE DEFINITIONS

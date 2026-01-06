@@ -9,9 +9,9 @@
 const { Worker } = require("node:worker_threads");
 const path = require("node:path");
 const EventEmitter = require("events");
-const Mutex = require("./lib/mutex");
-const Statement = require("./lib/statement");
-const { createError } = require("./lib/utils");
+const Mutex = require("./mutex");
+const Statement = require("./statement");
+const { createError } = require("./utils");
 
 // =============================================================================
 // INTERNAL TYPE DEFINITIONS
@@ -123,6 +123,11 @@ class Database extends EventEmitter {
       this.maxReaders = targetMax;
     }
 
+    /** * Indicates if the database is open and fully initialized.
+     * @type {boolean}
+     */
+    this.open = false;
+
     /** @type {string[]} Stores pragmas to replay on new workers. */
     this._initPragmas = [];
 
@@ -156,7 +161,7 @@ class Database extends EventEmitter {
     this.writeMutex = new Mutex();
 
     // Spawn the single Writer worker (Privileged thread)
-    this.writer = new Worker(path.resolve(__dirname, "lib/worker-write.js"), {
+    this.writer = new Worker(path.resolve(__dirname, "worker-write.js"), {
       workerData: { filename },
     });
 
@@ -215,18 +220,45 @@ class Database extends EventEmitter {
    * @private
    */
   async _waitForInitialization() {
-    // 1. Wait for Writer (Critical: File existence)
-    if (!this.writerReady) {
-      await this.writerReadyPromise;
+    try {
+      // 1. Wait for Writer (Critical: File existence)
+      if (!this.writerReady) {
+        await this.writerReadyPromise;
+      }
+
+      // 2. Wait for any booting Readers (Consistency: Ensure they receive broadcasts)
+      const pendingReaders = this.readers
+        .filter((r) => !r.ready && r.readyPromise)
+        .map((r) => r.readyPromise);
+
+      if (pendingReaders.length > 0) {
+        await Promise.all(pendingReaders);
+      }
+      this.open = true;
+      this.emit("open");
+    } catch (err) {
+      this.open = false;
+      this.emit("error", err);
+      // Ensure cleanup if init failed
+      await this.close();
     }
+  }
 
-    // 2. Wait for any booting Readers (Consistency: Ensure they receive broadcasts)
-    const pendingReaders = this.readers
-      .filter((r) => !r.ready && r.readyPromise)
-      .map((r) => r.readyPromise);
+  /**
+   * Returns a promise that resolves when the database pool is fully initialized.
+   * @returns {Promise<void>}
+   */
+  ready() {
+    return this._waitForInitialization();
+  }
 
-    if (pendingReaders.length > 0) {
-      await Promise.all(pendingReaders);
+  /**
+   * Helper to ensure DB is open before queuing work.
+   * @throws {TypeError}
+   */
+  _ensureOpen() {
+    if (!this.open) {
+      throw new TypeError("The database connection is not open");
     }
   }
 
@@ -349,16 +381,48 @@ class Database extends EventEmitter {
   /**
    * Close the database connection pool.
    * Terminates the Writer and all Reader workers.
-   * @returns {Promise<void>}
+   * @returns {Promise<this>}
    */
   async close() {
-    await this.writer.terminate();
-    await Promise.all(this.readers.map((r) => r.worker.terminate()));
+    this.open = false;
+    this.emit("close");
+
+    const promises = [];
+
+    // Terminate Readers
+    if (this.readers && this.readers.length > 0) {
+      promises.push(...this.readers.map((r) => r.worker.terminate()));
+    }
+
+    // Terminate Writer
+    if (this.writer) {
+      promises.push(this.writer.terminate());
+    }
+
+    await Promise.all(promises);
+
+    this.readers = [];
+    this.writer = null;
+    this.readQueue = [];
+    this.writeQueue.clear();
+    return this;
   }
 
   // ===========================================================================
   // INTERNAL ENGINE METHODS (Private)
   // ===========================================================================
+
+  /**
+   * Helper to broadcast a payload to ALL workers (Writer + Readers).
+   * @param {Object} payload
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _broadcast(payload) {
+    const writePromise = this._postWriter(payload);
+    const readPromises = this.readers.map((r) => this._postReader(r, payload));
+    await Promise.all([writePromise, ...readPromises]);
+  }
 
   /**
    * Generic helper to send a payload to the Writer and wait for a response.
@@ -434,7 +498,7 @@ class Database extends EventEmitter {
    * @private
    */
   _spawnReader() {
-    const worker = new Worker(path.resolve(__dirname, "lib/worker-read.js"), {
+    const worker = new Worker(path.resolve(__dirname, "worker-read.js"), {
       workerData: { filename: this.filename },
     });
 
@@ -607,6 +671,11 @@ class Database extends EventEmitter {
     // Strictly await initialization
     if (!this.writerReady) await this.writerReadyPromise;
 
+    // CRITICAL FIX: Check if we are still open after waiting
+    if (!this.writer) {
+      throw new TypeError("The database connection is not open");
+    }
+
     const isObj = typeof sqlOrPayload === "object" && sqlOrPayload !== null;
     const sql = isObj ? sqlOrPayload.sql : sqlOrPayload;
     const options = isObj ? sqlOrPayload.options : undefined;
@@ -629,9 +698,12 @@ class Database extends EventEmitter {
     if (this.memory) {
       return this._requestWrite(action, sqlOrPayload, params);
     }
-    // Wait for DB existence
-    if (!this.writerReady) {
-      await this.writerReadyPromise;
+
+    await this._waitForInitialization();
+
+    // CRITICAL FIX: Check if we are still open after waiting
+    if (!this.open || !this.writer) {
+      throw new TypeError("The database connection is not open");
     }
 
     return new Promise((resolve, reject) => {

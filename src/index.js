@@ -4,7 +4,7 @@
  */
 
 const { SqliteError } = require("better-sqlite3-multiple-ciphers");
-const { Database } = require("./database");
+const { Database } = require("./lib/database");
 const Statement = require("./lib/statement");
 
 // --- STATIC EXPORTS ---
