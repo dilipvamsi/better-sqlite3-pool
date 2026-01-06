@@ -143,7 +143,7 @@ await db.pragma('rekey = "new-password"');
 Functions are stringified and broadcast to all workers.
 
 ```javascript
-db.function("is_expensive", (price) => (price > 100 ? 1 : 0));
+await db.function("is_expensive", (price) => (price > 100 ? 1 : 0));
 const row = await db
   .prepare("SELECT is_expensive(price) as exp FROM products")
   .get();

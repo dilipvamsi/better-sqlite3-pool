@@ -22,7 +22,6 @@ declare module "better-sqlite3-pool" {
     function(name: string, fn: (...args: any[]) => any): Promise<this>;
 
     close(): Promise<void>;
-
   }
 
   // 2. The Namespace (For inner types and classes)
@@ -65,44 +64,103 @@ declare module "better-sqlite3-pool" {
   export = Database;
 }
 
+// Type definitions for the SQLite3Adapter compatibility layer
+// This matches the node-sqlite3 API structure.
 declare module "better-sqlite3-pool/adapter" {
-  import MainDatabase = require("better-sqlite3-pool");
+  import { EventEmitter } from "events";
+  import MainDatabase from "better-sqlite3-pool";
 
-  export interface RunResult {
-    changes: number;
-    lastID: number | bigint;
+  /**
+   * Standard callback for SQLite3 operations.
+   */
+  export type SqliteCallback<T = any> = (
+    this: RunContext,
+    err: Error | null,
+    row?: T,
+  ) => void;
+
+  /**
+   * Context bound to the 'this' keyword in callbacks for write operations.
+   */
+  export interface RunContext {
+    lastID?: number | bigint;
+    changes?: number;
   }
 
-  export class Database {
-    /** Access the underlying better-sqlite3-pool instance */
-    readonly db: MainDatabase;
-
+  /**
+   * The Adapter class that mimics node-sqlite3's Database class.
+   */
+  export class Database extends EventEmitter {
+    /**
+     * Opens the database connection pool.
+     * @param filename Path to database file or ':memory:'
+     * @param mode Optional mode (ignored, strictly for compatibility)
+     * @param callback Optional callback when opened
+     */
+    constructor(filename: string, callback?: (err: Error | null) => void);
     constructor(
       filename: string,
       mode?: number,
-      callback?: (err: Error | null) => void
+      callback?: (err: Error | null) => void,
     );
 
-    run(
-      sql: string,
-      callback?: (this: RunResult, err: Error | null) => void
-    ): void;
+    /** Access the underlying better-sqlite3-pool instance */
+    readonly db: MainDatabase;
 
-    run(
-      sql: string,
-      params: any[],
-      callback?: (this: RunResult, err: Error | null) => void
-    ): void;
-
-    all(sql: string, callback?: (err: Error | null, rows: any[]) => void): void;
-    all(
-      sql: string,
-      params: any[],
-      callback?: (err: Error | null, rows: any[]) => void
-    ): void;
-
+    /**
+     * Close the database connection.
+     */
     close(callback?: (err: Error | null) => void): void;
+
+    /**
+     * Execute a query that does NOT return rows (INSERT, UPDATE, DELETE).
+     */
+    run(sql: string, callback?: SqliteCallback<void>): this;
+    run(sql: string, params: any, callback?: SqliteCallback<void>): this;
+
+    /**
+     * Execute a query and return ALL rows (SELECT).
+     */
+    all<T = any>(
+      sql: string,
+      callback?: (this: RunContext, err: Error | null, rows: T[]) => void,
+    ): this;
+    all<T = any>(
+      sql: string,
+      params: any,
+      callback?: (this: RunContext, err: Error | null, rows: T[]) => void,
+    ): this;
+
+    /**
+     * Execute a query and execute a callback for EACH row.
+     * This streams data from the worker pool.
+     */
+    each<T = any>(
+      sql: string,
+      callback?: (this: RunContext, err: Error | null, row: T) => void,
+      complete?: (err: Error | null, count: number) => void,
+    ): this;
+    each<T = any>(
+      sql: string,
+      params: any,
+      callback?: (this: RunContext, err: Error | null, row: T) => void,
+      complete?: (err: Error | null, count: number) => void,
+    ): this;
+
+    /**
+     * Execute a query and return only the FIRST row.
+     * (Optional: You must implement .get() in adapter.js if you want strict compatibility)
+     */
+    get<T = any>(
+      sql: string,
+      callback?: (this: RunContext, err: Error | null, row: T) => void,
+    ): this;
+    get<T = any>(
+      sql: string,
+      params: any,
+      callback?: (this: RunContext, err: Error | null, row: T) => void,
+    ): this;
   }
 
-  export function verbose(): any;
+  export const verbose: () => { Database: typeof Database };
 }
