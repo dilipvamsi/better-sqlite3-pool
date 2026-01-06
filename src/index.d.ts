@@ -23,10 +23,6 @@ declare module "better-sqlite3-pool" {
 
     close(): Promise<void>;
 
-    /** The SQLiteError class used by this database */
-    static SqliteError: typeof Database.SqliteError;
-    /** The Statement class used by this database */
-    static Statement: typeof Database.Statement;
   }
 
   // 2. The Namespace (For inner types and classes)
