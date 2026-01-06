@@ -11,6 +11,9 @@ declare module "better-sqlite3-pool" {
     prepare(sql: string): Database.Statement;
     exec(sql: string): Promise<void>;
 
+    /** Dynamically resize the reader pool. */
+    pool(min: number, max: number): void;
+
     /** execute a PRAGMA. Broadcasts to all workers. */
     pragma(sql: string, options?: { simple?: boolean }): Promise<any>;
 
@@ -23,9 +26,9 @@ declare module "better-sqlite3-pool" {
   // 2. The Namespace (For inner types and classes)
   namespace Database {
     export interface Options {
-      /** Minimum number of reader workers (default: 2) */
+      /** Minimum number of reader workers (default: 1) */
       min?: number;
-      /** Maximum number of reader workers (default: 8) */
+      /** Maximum number of reader workers (default: 2) */
       max?: number;
     }
 
@@ -61,7 +64,9 @@ declare module "better-sqlite3-pool" {
 }
 
 declare module "better-sqlite3-pool/adapter" {
-  // 1. What is this?
+  // Import the main Database class to type the 'db' field
+  import MainDatabase = require("better-sqlite3-pool");
+
   // It defines the metadata returned after an INSERT/UPDATE/DELETE.
   export interface RunResult {
     changes: number;
@@ -69,13 +74,14 @@ declare module "better-sqlite3-pool/adapter" {
   }
 
   export class Database {
+    /** Access the underlying better-sqlite3-pool instance */
+    readonly db: MainDatabase;
     constructor(
       filename: string,
       mode?: number,
       callback?: (err: Error | null) => void
     );
 
-    // 2. Where is it used?
     // It is used as the 'this' context in the callback for run().
     // We explicitly type 'this' so TypeScript knows about .lastID and .changes
 

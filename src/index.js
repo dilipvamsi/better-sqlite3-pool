@@ -26,9 +26,27 @@ class Database extends EventEmitter {
     // Standard :memory: or empty string '' are private in-memory DBs
     this.memory = filename === ":memory:" || filename === "";
 
-    // If in memory, force 0 readers (everything must go to Writer)
-    this.minReaders = this.memory ? 0 : options.min || 2;
-    this.maxReaders = this.memory ? 0 : options.max || 8;
+    // 1. Determine Target Values
+    let targetMin = options.min !== undefined ? options.min : 1;
+    let targetMax = options.max !== undefined ? options.max : 2;
+
+    // 2. Validate Options (unless in memory mode, which overrides everything)
+    if (this.memory) {
+      this.minReaders = 0;
+      this.maxReaders = 0;
+    } else {
+      if (!Number.isInteger(targetMin) || targetMin < 0) {
+        throw new TypeError("options.min must be a positive integer");
+      }
+      if (!Number.isInteger(targetMax) || targetMax < 0) {
+        throw new TypeError("options.max must be a positive integer");
+      }
+      if (targetMin > targetMax) {
+        throw new RangeError("options.min cannot be greater than options.max");
+      }
+      this.minReaders = targetMin;
+      this.maxReaders = targetMax;
+    }
 
     // State to replay for new workers
     this._initPragmas = [];
@@ -91,7 +109,7 @@ class Database extends EventEmitter {
 
     // Send to Readers (Fire & Forget)
     this.readers.forEach((r) =>
-      r.worker.postMessage({ action: "exec", sql: `PRAGMA ${sql}`, id: -1 }),
+      r.worker.postMessage({ action: "exec", sql: `PRAGMA ${sql}`, id: -1 })
     );
 
     return options.simple ? undefined : [];
@@ -99,6 +117,43 @@ class Database extends EventEmitter {
 
   async exec(sql) {
     return this.prepare(sql).run();
+  }
+
+  /**
+   * Dynamically increases the size of the reader pool.
+   * New values must be greater than or equal to current settings.
+   * @param {number} min - New minimum readers (must be >= current min)
+   * @param {number} max - New maximum readers (must be >= current max)
+   */
+  pool(min, max) {
+    if (this.memory) return;
+
+    if (!Number.isInteger(min) || min < 0)
+      throw new Error("min must be a positive integer");
+    if (!Number.isInteger(max) || max < 0)
+      throw new Error("max must be a positive integer");
+    if (min > max) throw new Error("min cannot be greater than max");
+
+    // --- VALIDATION: Ensure we only Scale Up ---
+    // This guarantees we never need to shrink, preserving active workers.
+    if (min < this.minReaders) {
+      throw new Error(
+        `New min (${min}) cannot be smaller than current min (${this.minReaders})`
+      );
+    }
+    if (max < this.maxReaders) {
+      throw new Error(
+        `New max (${max}) cannot be smaller than current max (${this.maxReaders})`
+      );
+    }
+
+    this.minReaders = min;
+    this.maxReaders = max;
+
+    // Grow: Check if we are below the new min and spawn immediately
+    while (this.readers.length < this.minReaders) {
+      this._spawnReader();
+    }
   }
 
   async close() {
@@ -165,7 +220,7 @@ class Database extends EventEmitter {
         this._cleanupWorker(
           queue,
           new Error(`Worker exited with code ${code}`),
-          readerRef,
+          readerRef
         );
       }
     });
