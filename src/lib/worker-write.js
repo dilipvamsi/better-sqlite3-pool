@@ -13,6 +13,15 @@ const { deserializeFunction } = require("./utils");
 // =============================================================================
 
 /**
+ * @typedef {Object} WorkerData
+ * @property {string} filename - Path to the SQLite database file.
+ * @property {boolean} [fileMustExist] - If true, throws if the database file does not exist.
+ * @property {number} [timeout] - The number of milliseconds to wait when locking the database.
+ * @property {string} [nativeBinding] - Path to the native addon executable.
+ * @property {boolean} [readonly] - Open the database in read-only mode (unused by writer).
+ */
+
+/**
  * @typedef {Object} WorkerPayload
  * @property {number} [id] - The message ID (used for correlation).
  * @property {'run' | 'exec' | 'all' | 'get' | 'function'} action - The operation.
@@ -27,20 +36,67 @@ const { deserializeFunction } = require("./utils");
 // INITIALIZATION
 // =============================================================================
 
-const db = new Database(workerData.filename);
+// Extract configuration passed from the main thread
+/** @type {WorkerData} */
+const { filename, fileMustExist, timeout, nativeBinding } = workerData;
 
-/**
- * Enable Write-Ahead Logging (WAL).
- * This is CRITICAL for concurrency. It allows Readers to read from the DB
- * while this Writer is writing to it, without blocking each other.
- */
-db.pragma("journal_mode = WAL");
+// console.log("writer: ",workerData);
 
-/**
- * Set a busy timeout (5000ms).
- * If the DB is locked by an external process (e.g. backup), wait 5s before throwing SQLITE_BUSY.
- */
-db.pragma("busy_timeout = 5000");
+let db;
+
+try {
+  const options = {};
+
+  if (fileMustExist) options.fileMustExist = true;
+  if (nativeBinding) options.nativeBinding = nativeBinding;
+
+  // Set busy_timeout in constructor.
+  // Default to 5000ms if not provided. This allows us to wait if the DB
+  // is locked by an external process (e.g. previous test worker),
+  // preventing startup crashes when setting WAL mode.
+  options.timeout = timeout !== undefined ? timeout : 5000;
+
+  db = new Database(filename, options);
+} catch (err) {
+  // Catch startup errors (e.g. file does not exist, binding issues)
+  // and report them back to the main thread so the Promise rejects.
+  if (parentPort) {
+    parentPort.postMessage({
+      status: "error",
+      error: {
+        message: err.message || "Worker initialization failed",
+        code: err.code, // CRITICAL: Pass the SQLITE_ code (e.g. SQLITE_CANTOPEN)
+      },
+    });
+    process.exit(0);
+  }
+  throw err;
+}
+
+const isMemory = filename === ":memory:" || filename === "";
+
+try {
+  /**
+   * Configure Connection Pragma.
+   * Strictly only for file-based databases to avoid V8 panics on memory DBs.
+   */
+  if (!isMemory) {
+    // Enable Write-Ahead Logging (WAL).
+    // This requires a lock. Thanks to options.timeout, we wait if necessary.
+    db.pragma("journal_mode = WAL");
+  }
+} catch (err) {
+  // Suppress initialization errors regarding pragmas.
+  // In some environments, failing to set a pragma during worker boot can cause
+  // issues, but if the DB is open, we try to proceed.
+  if (parentPort) {
+    parentPort.postMessage({
+      id: -1,
+      status: "error",
+      error: `Init Warning: ${err.message}`,
+    });
+  }
+}
 
 /**
  * Enable BigInt support.

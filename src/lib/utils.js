@@ -2,6 +2,8 @@
  * @file lib/utils.js
  * @description Utilities for schema-aware type casting and UDF helpers.
  */
+const fs = require("fs/promises");
+const path = require("path");
 const { SqliteError } = require("better-sqlite3-multiple-ciphers");
 
 // SQL types that must ALWAYS remain BigInt in JS to preserve precision.
@@ -63,6 +65,11 @@ function deserializeFunction(fnString) {
  * @returns {Error}
  */
 function createError(errPayload) {
+  // Guard against undefined/null payload
+  if (!errPayload) {
+    return new Error("Unknown Worker Error");
+  }
+
   // 1. If it's already a SqliteError (e.g. caught locally), return it as-is.
   if (errPayload instanceof SqliteError) {
     return errPayload;
@@ -85,7 +92,59 @@ function createError(errPayload) {
     return new SqliteError(msg, code);
   }
 
-  return new Error(msg);
+  const err = new Error(msg);
+  if (code) err.code = code; // Attach code if present (e.g. ENOENT)
+  return err;
 }
 
-module.exports = { castRow, deserializeFunction, createError };
+/**
+ * Check if the file exists.
+ * @param {string} path - file path
+ * @returns {Promise<boolean>}
+ */
+async function fileExists(filePath) {
+  try {
+    await fs.access(filePath); // Tries to access the file
+    return true; // If successful, the file exists
+  } catch (error) {
+    // If an error is thrown, the file does not exist or is inaccessible
+    if (error.code === "ENOENT") {
+      return false;
+    }
+    // For other errors (e.g., permission issues), you might want to throw the error
+    throw error;
+  }
+}
+
+/**
+ * Check if the parent directory exists.
+ * @param {string} path - file path
+ * @returns {Promise<boolean>}
+ */
+async function parentDirectoryExists(targetPath) {
+  // Get the path of the parent directory
+  const parentDir = path.dirname(targetPath);
+
+  try {
+    // Check if the parent directory can be accessed (F_OK checks for visibility)
+    await fs.access(parentDir, fs.constants.F_OK);
+    // console.log(`Parent directory exists: ${parentDir}`);
+    return true;
+  } catch (error) {
+    // If access fails, the directory likely doesn't exist (ENOENT error code)
+    if (error.code === "ENOENT") {
+      // console.log(`Parent directory does not exist: ${parentDir}`);
+      return false;
+    }
+    // Re-throw other unexpected errors (e.g., permission issues)
+    throw error;
+  }
+}
+
+module.exports = {
+  castRow,
+  deserializeFunction,
+  createError,
+  fileExists,
+  parentDirectoryExists,
+};

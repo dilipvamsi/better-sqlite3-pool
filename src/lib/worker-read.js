@@ -13,6 +13,15 @@ const { deserializeFunction } = require("./utils");
 // =============================================================================
 
 /**
+ * @typedef {Object} WorkerData
+ * @property {string} filename - Path to the SQLite database file.
+ * @property {boolean} [fileMustExist] - If true, throws if the database file does not exist.
+ * @property {number} [timeout] - The number of milliseconds to wait when locking the database.
+ * @property {string} [nativeBinding] - Path to the native addon executable.
+ * @property {boolean} [readonly] - Open the database in read-only mode.
+ */
+
+/**
  * @typedef {Object} WorkerPayload
  * @property {number} [id] - The message ID (used for correlation).
  * @property {'exec' | 'function' | 'stream_open' | 'stream_ack' | 'stream_close'} action - The operation to perform.
@@ -33,11 +42,42 @@ const { deserializeFunction } = require("./utils");
 // INITIALIZATION
 // =============================================================================
 
-// Open DB in Read-Only mode to prevent accidental writes from this worker
-const db = new Database(workerData.filename, { readonly: true });
+// Extract configuration passed from the main thread
+/** @type {WorkerData} */
+const { filename, fileMustExist, timeout, nativeBinding } = workerData;
 
-// prevent SQLITE_BUSY errors during heavy concurrency
-db.pragma("busy_timeout = 5000");
+// console.log("reader: ",workerData);
+
+let db;
+
+try {
+  const options = {
+    readonly: true, // Readers are always read-only
+  };
+
+  if (fileMustExist) options.fileMustExist = true;
+  if (nativeBinding) options.nativeBinding = nativeBinding;
+
+  // Set busy_timeout via constructor options.
+  // Default to 5000ms if not provided to match standard retry behavior.
+  options.timeout = timeout !== undefined ? timeout : 5000;
+
+  db = new Database(filename, options);
+} catch (err) {
+  // Catch startup errors (e.g. file does not exist, binding issues)
+  // and report them back to the main thread so the Promise rejects.
+  if (parentPort) {
+    parentPort.postMessage({
+      status: "error",
+      error: {
+        message: err.message || "Worker initialization failed",
+        code: err.code, // CRITICAL: Pass the SQLITE_ code (e.g. SQLITE_CANTOPEN)
+      },
+    });
+    process.exit(0);
+  }
+  throw err;
+}
 
 // Enable BigInt support for large integers
 db.defaultSafeIntegers(true);

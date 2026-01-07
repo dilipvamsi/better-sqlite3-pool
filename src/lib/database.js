@@ -11,7 +11,8 @@ const path = require("node:path");
 const EventEmitter = require("events");
 const Mutex = require("./mutex");
 const Statement = require("./statement");
-const { createError } = require("./utils");
+const { createError, fileExists, parentDirectoryExists } = require("./utils");
+const { SqliteError } = require("better-sqlite3-multiple-ciphers");
 
 // =============================================================================
 // INTERNAL TYPE DEFINITIONS
@@ -19,8 +20,13 @@ const { createError } = require("./utils");
 
 /**
  * @typedef {Object} DatabaseOptions
- * @property {number} [min=1] - Minimum number of reader workers to keep alive.
- * @property {number} [max=2] - Maximum number of reader workers allowed.
+ * @property {number} [minWorkers=1] - Minimum number of reader workers (alias: min).
+ * @property {number} [maxWorkers=2] - Maximum number of reader workers (alias: max).
+ * @property {boolean} [readonly=false] - Open the database in read-only mode.
+ * @property {boolean} [fileMustExist=false] - If true, throws if the database file does not exist.
+ * @property {number} [timeout=5000] - The number of milliseconds to wait when locking the database.
+ * @property {string} [nativeBinding] - Path to the native addon executable.
+ * @property {Function} [verbose] - (Not supported in threaded mode) Function to call with execution information.
  */
 
 /**
@@ -71,7 +77,7 @@ const { createError } = require("./utils");
  * @typedef {Object} WorkerResponse
  * @property {number} id - The correlation ID matching the request.
  * @property {'success' | 'error' | 'stream_data'} status - The outcome status.
- * @property {any} [data] - The result payload (on success).
+ * @property {any} [data] - The result payload (on success).SQLITE_CANTOPEN
  * @property {any} [error] - The error payload (on error).
  */
 
@@ -97,12 +103,29 @@ class Database extends EventEmitter {
    * This method spawns workers and waits for the database file to be ready.
    *
    * @param {string} filename - Path to the SQLite database file (or ':memory:').
-   * @param {Object} [options] - Configuration options.
-   * @param {number} [options.min=2] - Minimum number of reader workers to keep alive.
-   * @param {number} [options.max=8] - Maximum number of reader workers allowed.
+   * @param {DatabaseOptions} [options] - Configuration options.
    * @returns {Promise<Database>} A fully initialized Database instance.
    */
   static async create(filename, options = {}) {
+    if (typeof filename != "string") {
+      throw new TypeError("filename has to be string");
+    }
+    if (options != undefined && typeof options != "object") {
+      throw new TypeError("Options has to be object");
+    }
+
+    const parentDirExists = await parentDirectoryExists(filename);
+    if (!parentDirExists) {
+      throw new SqliteError(
+        `${filename} parent directory does not exist`,
+        "SQLITE_CANTOPEN",
+      );
+    }
+
+    const exists = await fileExists(filename);
+    options = options === undefined ? {} : options;
+    options.exists = exists;
+
     const db = new this(filename, options, kInternal);
     try {
       await db.ready();
@@ -116,9 +139,7 @@ class Database extends EventEmitter {
   /**
    * Create a new Database connection pool.
    * @param {string} filename - Path to the SQLite database file (or ':memory:').
-   * @param {Object} [options] - Configuration options.
-   * @param {number} [options.min=2] - Minimum number of reader workers to keep alive.
-   * @param {number} [options.max=8] - Maximum number of reader workers allowed.
+   * @param {DatabaseOptions} [options] - Configuration Options
    * @param {Symbol} [token] - Internal token to prevent public usage.
    * @throws {TypeError|RangeError} If options are invalid.
    */
@@ -128,34 +149,113 @@ class Database extends EventEmitter {
         "Direct constructor usage is not supported. Use 'await Database.create(filename, options)' instead.",
       );
     }
-    if (typeof filename != "string")
-      throw new TypeError("filename has to be string");
     super();
-    this.filename = filename;
-    this.options = options;
+    this.name = filename;
+
+    // --- Configuration Validation ---
+    let minReaders = options.minWorkers !== undefined ? options.minWorkers : 1;
+    let maxReaders = options.maxWorkers !== undefined ? options.maxWorkers : 2;
+
+    // Validate Types
+    if (!Number.isInteger(minReaders) || minReaders < 0) {
+      throw new TypeError("options.minWorkers must be a positive integer");
+    }
+    if (!Number.isInteger(maxReaders) || maxReaders < 0) {
+      throw new TypeError("options.maxWorkers must be a positive integer");
+    }
+    if (minReaders > maxReaders) {
+      throw new RangeError(
+        "options.minWorkers cannot be greater than options.maxWorkers",
+      );
+    }
+    if (
+      options.readonly !== undefined &&
+      typeof options.readonly !== "boolean"
+    ) {
+      throw new TypeError("options.readonly must be a boolean");
+    }
+
+    if (
+      options.fileMustExist !== undefined &&
+      typeof options.fileMustExist !== "boolean"
+    ) {
+      throw new TypeError("options.fileMustExist must be a boolean");
+    }
+    if (
+      options.timeout !== undefined &&
+      (!Number.isInteger(options.timeout) || options.timeout < 0)
+    ) {
+      throw new TypeError("options.timeout must be a positive integer");
+    } else if (options.timeout > 0x7fffffff) {
+      // 2147483647
+      throw new RangeError(
+        "options.timeout should not be greater than max 32 bit integer",
+      );
+    }
+    if (
+      options.nativeBinding !== undefined &&
+      typeof options.nativeBinding !== "string"
+    ) {
+      throw new TypeError("options.nativeBinding must be a string");
+    }
+
+    this.readonly = options?.readonly === true;
 
     /** @type {boolean} - True if the database is strictly in-memory. */
     this.memory = filename === ":memory:" || filename === "";
 
-    // --- Configuration Validation ---
-    let targetMin = options.min !== undefined ? options.min : 1;
-    let targetMax = options.max !== undefined ? options.max : 2;
+    // console.log("database: ", {
+    //   ...options,
+    //   ...{
+    //     filename,
+    //     readonly: this.readonly,
+    //     memory: this.memory,
+    //   },
+    // });
+
+    if (this.readonly) {
+      if (this.memory) {
+        throw new TypeError(
+          "In memory database cannot be reaSQLITE_CANTOPENdonly",
+        );
+      }
+      if (!options.exists) {
+        throw new SqliteError(
+          `${filename} should exist for read only mode`,
+          "SQLITE_CANTOPEN",
+        );
+      }
+    }
+
+    if (options.fileMustExist === true) {
+      if (!options.exists) {
+        throw new SqliteError(
+          `${filename} should already be exisiting`,
+          "SQLITE_CANTOPEN",
+        );
+      }
+    }
 
     if (this.memory) {
       // In-memory DBs cannot share state across threads easily, so we disable the pool.
       // All queries will be routed to the single "Writer" thread.
       this.minReaders = 0;
       this.maxReaders = 0;
+      // this.readonly = false; // Memory DBs must be writable to exist
     } else {
-      if (!Number.isInteger(targetMin) || targetMin < 0)
-        throw new TypeError("options.min must be a positive integer");
-      if (!Number.isInteger(targetMax) || targetMax < 0)
-        throw new TypeError("options.max must be a positive integer");
-      if (targetMin > targetMax)
-        throw new RangeError("options.min cannot be greater than options.max");
-      this.minReaders = targetMin;
-      this.maxReaders = targetMax;
+      this.minReaders = minReaders;
+      this.maxReaders = maxReaders;
     }
+
+    /** @type {DatabaseOptions} - Configuration Options. */
+    this.options = {
+      readonly: this.readonly,
+      fileMustExist: !!options.fileMustExist,
+      timeout: options.timeout,
+      nativeBinding: options.nativeBinding,
+      minReaders,
+      maxReaders,
+    };
 
     /** * Indicates if the database is open and fully initialized.
      * @type {boolean}
@@ -187,40 +287,22 @@ class Database extends EventEmitter {
 
     // --- WRITER SETUP ---
 
+    // --- WORKER CONFIGURATION ---
+    // Prepare the payload that goes to every worker
+    this._workerConfig = {
+      filename: this.name,
+      readonly: this.readonly,
+      fileMustExist: this.options.fileMustExist,
+      timeout: this.options.timeout,
+      nativeBinding: this.options.nativeBinding,
+    };
+
     /** @type {Map<number, PendingPromise>} - Pending write tasks. */
     this.writeQueue = new Map();
     /** @type {number} - Auto-incrementing ID for write tasks. */
     this.writeId = 0;
     /** @type {Mutex} - Serializes write operations to ensure ACID compliance. */
     this.writeMutex = new Mutex();
-
-    // Spawn the single Writer worker (Privileged thread)
-    this.writer = new Worker(path.resolve(__dirname, "worker-write.js"), {
-      workerData: { filename },
-    });
-
-    // Listen for messages from the Writer
-    this.writer.on("message", (msg) => {
-      // Handle the specific "Ready" signal
-      if (msg.status === "ready") {
-        this.writerReady = true;
-
-        // Replay any settings configured before the DB was ready
-        this._replayStateToWorker(this.writer);
-
-        // Resolve the initialization promise
-        if (this._resolveWriterReady) this._resolveWriterReady();
-
-        // Safe to start readers now that the file exists
-        if (!this.memory) this._initReaders();
-        return;
-      }
-      // Handle standard query results
-      this._handleMsg(this.writeQueue, msg);
-    });
-
-    // Delegate error handling to dedicated binder
-    this._bindWriteWorkerEvents(this.writer);
 
     // --- READER SETUP ---
 
@@ -234,8 +316,46 @@ class Database extends EventEmitter {
      */
     this.readQueue = [];
 
+    if (!this.readonly) {
+      // Spawn the single Writer worker (Privileged thread)
+      this.writer = new Worker(path.resolve(__dirname, "worker-write.js"), {
+        workerData: this._workerConfig,
+      });
+
+      // Listen for messages from the Writer
+      this.writer.on("message", (msg) => {
+        // Handle the specific "Ready" signal
+        if (msg.status === "ready") {
+          this.writerReady = true;
+
+          // Replay any settings configured before the DB was ready
+          this._replayStateToWorker(this.writer);
+
+          // Resolve the initialization promise
+          if (this._resolveWriterReady) this._resolveWriterReady();
+
+          // Safe to start readers now that the file exists
+          if (!this.memory) this._initReaders();
+          return;
+        }
+        // Handle standard query results
+        this._handleMsg(this.writeQueue, msg);
+      });
+
+      // Delegate error handling to dedicated binder
+      this._bindWriteWorkerEvents(this.writer);
+    } else {
+      // READONLY MODE: No Writer thread.
+      this.writer = null;
+      this.writerReady = true;
+      // Resolve promise immediately so we don't block initialization
+      this._resolveWriterReady();
+      // Start readers immediately (assuming DB file exists on disk)
+      this._initReaders();
+    }
+
     /** @type {boolean} - Internal flag for transaction state tracking. */
-    this._inTransaction = false;
+    this.inTransaction = false;
   }
 
   /**
@@ -256,6 +376,7 @@ class Database extends EventEmitter {
   async _waitForInitialization() {
     try {
       // 1. Wait for Writer (Critical: File existence)
+      // In readonly, this resolves immediately.
       if (!this.writerReady) {
         await this.writerReadyPromise;
       }
@@ -305,6 +426,7 @@ class Database extends EventEmitter {
    * @returns {Promise<this>} The Database instance.
    */
   async function(name, fn) {
+    this._ensureOpen();
     if (typeof name !== "string")
       throw new TypeError("Expected first argument to be a string");
     if (typeof fn !== "function")
@@ -314,12 +436,18 @@ class Database extends EventEmitter {
     this._initFunctions.push({ name, fnString });
     const payload = { action: "function", fnName: name, fnString };
 
-    // Send to Writer and wait for Ack
-    const writePromise = this._postWriter(payload);
     // Send to Readers and wait for Ack
     const readPromises = this.readers.map((r) => this._postReader(r, payload));
 
-    await Promise.all([writePromise, ...readPromises]);
+    if (!this.readonly) {
+      // Send to Writer and wait for Ack
+      const writePromise = this._postWriter(payload);
+      await Promise.all([writePromise, ...readPromises]);
+    } else {
+      // Readonly: only readers
+      await Promise.all(readPromises);
+    }
+
     return this;
   }
 
@@ -333,22 +461,28 @@ class Database extends EventEmitter {
    * @returns {Promise<any>} The result of the PRAGMA execution.
    */
   async pragma(sql, options = {}) {
+    this._ensureOpen();
     this._initPragmas.push(sql);
     const payload = { action: "exec", sql: `PRAGMA ${sql}` };
 
-    // Send to Writer (Primary execution)
-    const writePromise = this._postWriter({
-      ...payload,
-      params: [],
-      options: {},
-    });
-    // Send to Readers (Synchronization only)
     const readPromises = this.readers.map((r) => this._postReader(r, payload));
 
-    // Wait for everyone, but return the Writer's result
-    const [result] = await Promise.all([writePromise, ...readPromises]);
+    if (!this.readonly) {
+      // Send to Writer (Primary execution)
+      const writePromise = this._postWriter({
+        ...payload,
+        params: [],
+        options: {},
+      });
 
-    return options.simple ? undefined : result;
+      // Wait for everyone, but return the Writer's result
+      const results = await Promise.all([writePromise, ...readPromises]);
+      return options.simple ? undefined : results[0];
+    } else {
+      // Readonly: Broadcast to readers, return result from first reader
+      const results = await Promise.all(readPromises);
+      return options.simple ? undefined : results[0];
+    }
   }
 
   /**
@@ -358,6 +492,7 @@ class Database extends EventEmitter {
    * @returns {Promise<void>}
    */
   async exec(sql) {
+    this._ensureOpen();
     return this.prepare(sql).run();
   }
 
@@ -369,6 +504,7 @@ class Database extends EventEmitter {
    * @returns {Promise<void>}
    */
   async pool(min, max) {
+    this._ensureOpen();
     if (this.memory) return;
 
     // Validate inputs
@@ -410,6 +546,7 @@ class Database extends EventEmitter {
    * @returns {Promise<this>}
    */
   async close() {
+    this._ensureOpen();
     this.open = false;
     this.emit("close");
 
@@ -420,7 +557,7 @@ class Database extends EventEmitter {
       promises.push(...this.readers.map((r) => r.worker.terminate()));
     }
 
-    // Terminate Writer
+    // Terminate Writer (if exists)
     if (this.writer) {
       promises.push(this.writer.terminate());
     }
@@ -445,9 +582,13 @@ class Database extends EventEmitter {
    * @private
    */
   async _broadcast(payload) {
-    const writePromise = this._postWriter(payload);
     const readPromises = this.readers.map((r) => this._postReader(r, payload));
-    await Promise.all([writePromise, ...readPromises]);
+    if (this.writer) {
+      const writePromise = this._postWriter(payload);
+      await Promise.all([writePromise, ...readPromises]);
+    } else {
+      await Promise.all(readPromises);
+    }
   }
 
   /**
@@ -458,8 +599,9 @@ class Database extends EventEmitter {
    * @private
    */
   async _postWriter(payload) {
+    this._ensureOpen();
     // Acquire lock if not already inside a transaction
-    const lock = !this._inTransaction;
+    const lock = !this.inTransaction;
     if (lock) await this.writeMutex.acquire();
     try {
       return await new Promise((resolve, reject) => {
@@ -481,6 +623,7 @@ class Database extends EventEmitter {
    * @private
    */
   _postReader(reader, payload) {
+    this._ensureOpen();
     return new Promise((resolve, reject) => {
       const id = Date.now() + Math.random();
       reader.queue.set(id, { resolve, reject });
@@ -525,7 +668,7 @@ class Database extends EventEmitter {
    */
   _spawnReader() {
     const worker = new Worker(path.resolve(__dirname, "worker-read.js"), {
-      workerData: { filename: this.filename },
+      workerData: this._workerConfig,
     });
 
     // Sync state immediately
@@ -556,6 +699,14 @@ class Database extends EventEmitter {
         this._drainSpecificReaderQueue(reader);
         return;
       }
+
+      // Handle Startup Error (CRITICAL FIX)
+      // The worker sends this if the DB file is missing in readonly mode, then exits.
+      if (msg.status === "error" && !reader.ready) {
+        if (rejectReady) rejectReady(createError(msg.error));
+        return;
+      }
+
       // Handle Data Stream/Result
       if (msg.status !== "stream_data") {
         this._handleMsg(reader.queue, msg);
@@ -694,6 +845,11 @@ class Database extends EventEmitter {
    * @private
    */
   async _requestWrite(action, sqlOrPayload, params) {
+    this._ensureOpen();
+    if (this.readonly) {
+      throw new Error("Cannot execute write operation in readonly mode");
+    }
+
     // Strictly await initialization
     if (!this.writerReady) await this.writerReadyPromise;
 
@@ -720,13 +876,19 @@ class Database extends EventEmitter {
    * @private
    */
   async _requestRead(action, sqlOrPayload, params) {
+    this._ensureOpen();
     // If in memory, fallback to Writer
     if (this.memory) {
       return this._requestWrite(action, sqlOrPayload, params);
     }
 
-    // CRITICAL FIX: Check if we are still open after waiting
-    if (!this.open || !this.writer) {
+    // Check availability
+    if (!this.open) {
+      // In readonly, writer might be null, so check open flag primarily
+      throw new TypeError("The database connection is not open");
+    }
+    // Double check writer existence if NOT readonly
+    if (!this.readonly && !this.writer) {
       throw new TypeError("The database connection is not open");
     }
 
@@ -762,6 +924,7 @@ class Database extends EventEmitter {
    * @private
    */
   async _execRead(reader, task) {
+    this._ensureOpen();
     reader.busy = true;
     const id = Math.random();
     reader.queue.set(id, task);
