@@ -1,5 +1,5 @@
 /**
- * @file database.js
+ * @file lib/database.js
  * @description Database implementation of better-sqlite3-pool.
  * This module manages a thread pool of SQLite connections, coordinating a single
  * Writer worker (WAL mode) and multiple Reader workers to enable high-concurrency
@@ -145,7 +145,7 @@ class Database extends EventEmitter {
    */
   constructor(filename, options = {}, token) {
     if (token !== kInternal) {
-      throw new Error(
+      throw new ReferenceError(
         "Direct constructor usage is not supported. Use 'await Database.create(filename, options)' instead.",
       );
     }

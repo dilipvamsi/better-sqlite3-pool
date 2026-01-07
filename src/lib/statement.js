@@ -168,7 +168,7 @@ class Statement {
     // 1. Transaction: Must use Writer (Reader workers don't see uncommitted data).
     // 2. Write Query: Queries with RETURNING (INSERT..RETURNING) must go to Writer.
     // 3. Memory DB: Only Writer exists (Readers are disabled).
-    if (this.db._inTransaction || !this.reader || this.db.memory) {
+    if (this.db.inTransaction || !this.reader || this.db.memory) {
       result = await this.db._requestWrite("all", payload);
     } else {
       result = await this.db._requestRead("all", payload);
