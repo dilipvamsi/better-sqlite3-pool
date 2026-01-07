@@ -49,17 +49,6 @@ function castRow(row, columns) {
 }
 
 /**
- * Reconstructs a function from a string.
- * Used for passing UDFs to worker threads.
- * @param {string} fnString - The .toString() of a function.
- * @returns {Function} The executable function.
- */
-function deserializeFunction(fnString) {
-  // Wrap in parenthesis to ensure it evaluates as an expression, not a statement
-  return (0, eval)(`(${fnString})`);
-}
-
-/**
  * Reconstructs a genuine SqliteError or Error from the worker payload.
  * @param {Object} errPayload - { message, code }
  * @returns {Error}
@@ -143,7 +132,6 @@ async function parentDirectoryExists(targetPath) {
 
 module.exports = {
   castRow,
-  deserializeFunction,
   createError,
   fileExists,
   parentDirectoryExists,

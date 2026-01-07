@@ -74,6 +74,6 @@ describe("Database#close()", function () {
     await this.db.close();
 
     expect(existsSync(util.current())).to.be.true;
-    // expect(existsSync(`${util.current()}-wal`)).to.be.false;
+    expect(existsSync(`${util.current()}-wal`)).to.be.false;
   });
 });

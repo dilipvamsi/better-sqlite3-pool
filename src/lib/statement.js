@@ -5,6 +5,7 @@
  */
 
 const { castRow } = require("./utils");
+const { SingleWorkerClient } = require("./worker-pool");
 
 // =============================================================================
 // TYPE DEFINITIONS
@@ -199,136 +200,87 @@ class Statement {
 
   /**
    * Execute the query and return an Async Iterator.
-   * Uses a streaming protocol with backpressure control.
+   * Uses a sticky worker connection and streaming protocol.
    * @param {...any} params
    * @returns {AsyncIterableIterator<any>}
    */
   async *iterate(...params) {
     this.db._ensureOpen();
-    const p = params.length ? params : this.boundParams;
+    const stmtParams = params.length ? params : this.boundParams;
 
-    // --- FALLBACK: IN-MEMORY MODE ---
-    if (this.db.memory) {
-      // Streaming requires locking a specific worker statefully.
-      // Since the Writer handles all requests in memory mode, locking it for a stream
-      // would block the entire DB.
-      // Fallback: Fetch ALL rows into RAM and yield them.
-      const rows = await this.all(...p);
+    // --- FALLBACK: IN-MEMORY / NO POOL ---
+    if (this.db.memory || (!this.db.readerPool && this.db.writer)) {
+      const rows = await this.all(...stmtParams);
       for (const row of rows) yield row;
       return;
     }
 
-    // --- STREAM SETUP ---
+    // --- WORKER ACQUISITION ---
+    /** @type {SingleWorkerClient} */
+    let workerClient;
+
+    if (this.db.inTransaction || !this.reader) {
+      if (!this.db.writer) throw new Error("No writer available");
+      workerClient = this.db.writer;
+    } else {
+      workerClient = await this.db.readerPool.getWorker();
+    }
+
+    // PIN THE WORKER
+    workerClient.pin();
+
     const streamId = Math.random().toString(36).slice(2);
-
-    // 1. Acquire a Reader
-    // We strictly need a 'free' reader to lock it. If all are busy, we wait or take one.
-    // Note: This simple logic takes the first available or the first one if all busy.
-    // In a production refined version, you might want to wait for a free slot.
-    const worker = this.db.readers.find((r) => !r.busy) || this.db.readers[0];
-
-    // Mark as busy so the Load Balancer doesn't assign other 'all/get' tasks to it
-    worker.busy = true;
-
-    const queue = [];
-    let resolver = null;
-    let active = true;
-    let columns = null; // Store column metadata for casting
-
-    /**
-     * @typedef {Object} StreamMessage
-     * @property {'stream_data'} status
-     * @property {string} streamId
-     * @property {string} [error]
-     * @property {any[]} [data]
-     * @property {any[]} [columns]
-     * @property {boolean} [done]
-     */
-
-    /**
-     * @param {StreamMessage} msg
-     */
-    const onMsg = (msg) => {
-      // Ensure we only listen to OUR stream's messages
-      if (msg.status === "stream_data" && msg.streamId === streamId) {
-        if (msg.error) {
-          active = false;
-          if (resolver) resolver.reject(new Error(msg.error));
-          return;
-        }
-
-        // First packet might contain column metadata
-        if (msg.columns) {
-          columns = msg.columns;
-        }
-
-        if (msg.data) {
-          queue.push(...msg.data);
-        }
-
-        if (msg.done) {
-          active = false;
-          queue.push(null); // EOF Sentinel
-        }
-
-        // Wake up the generator
-        if (resolver) {
-          const r = resolver;
-          resolver = null;
-          r.resolve();
-        }
-      }
-    };
-
-    worker.worker.on("message", onMsg);
+    let columns = null;
 
     try {
-      // 2. Start the Stream
-      worker.worker.postMessage({
-        id: streamId,
+      // 1. OPEN STREAM (Get first batch)
+      let result = await workerClient.execute({
         action: "stream_open",
         streamId,
         sql: this.source,
-        params: p,
-        options: this._getOptions(), // Pass options like raw/pluck to worker
+        params: stmtParams,
+        options: this._getOptions(),
       });
 
-      // 3. Consume Loop
-      while (true) {
-        // If queue is empty, wait for data
-        if (queue.length === 0) {
-          if (!active) break;
-          await new Promise(
-            (res, rej) => (resolver = { resolve: res, reject: rej }),
-          );
+      if (result.columns) columns = result.columns;
+
+      // Process and yield first batch
+      if (result.rows && result.rows.length > 0) {
+        // Store in list and yield explicit elements
+        const rows = result.rows;
+        for (const row of rows) {
+          // Perform casting inline to avoid iterating twice
+          if (!this._raw && !this._pluck && columns) {
+            castRow(row, columns);
+          }
+          yield row;
         }
+      }
 
-        const row = queue.shift();
-        if (row === null) break; // EOF
+      // 2. CONSUME REST
+      while (!result.done) {
+        // Request next batch
+        result = await workerClient.execute({
+          action: "stream_next",
+          streamId,
+        });
 
-        // Apply Casting (same logic as .all())
-        if (!this._raw && !this._pluck && columns) {
-          castRow(row, columns);
-        }
-
-        yield row;
-
-        // 4. Backpressure / Flow Control
-        // If the local buffer is getting low, ask the worker for more data.
-        if (queue.length < 25 && active) {
-          worker.worker.postMessage({
-            id: streamId,
-            action: "stream_ack",
-            streamId,
-          });
+        if (result.rows && result.rows.length > 0) {
+          const rows = result.rows;
+          for (const row of rows) {
+            if (!this._raw && !this._pluck && columns) {
+              castRow(row, columns);
+            }
+            yield row;
+          }
         }
       }
     } finally {
-      // 5. Cleanup
-      worker.worker.off("message", onMsg);
-      // Tell worker to kill the iterator if we stopped early (e.g. break inside for-await-of)
-      worker.worker.postMessage({ action: "stream_close", streamId });
-      worker.busy = false;
+      // 3. CLEANUP
+      workerClient
+        .execute({ action: "stream_close", streamId })
+        .catch(() => {});
+      workerClient.unpin();
     }
   }
 

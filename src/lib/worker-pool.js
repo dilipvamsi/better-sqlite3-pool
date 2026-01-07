@@ -11,8 +11,9 @@
  */
 
 const { Worker } = require("worker_threads");
-const Mutex = require("./mutex");
 const { EventEmitter } = require("events");
+const { SqliteError } = require("better-sqlite3-multiple-ciphers");
+const Mutex = require("./mutex");
 
 // =======================================================================
 // PRIVATE TOKENS (Internal access only)
@@ -23,6 +24,17 @@ const kMultiWorker = Symbol("MultiWorker");
 // =======================================================================
 // 1. SINGLE WORKER WRAPPER
 // =======================================================================
+
+/**
+ * @typedef {Object} WorkerMessage
+ * @property {string} requestId - Correlates to the request.
+ * @property {'success' | 'error'} status - Outcome status.
+ * @property {any} [data] - Success payload.
+ * @property {Object} [error] - Error details.
+ * @property {string} [error.message]
+ * @property {string} [error.code]
+ * @property {string} [streamId]
+ */
 
 /**
  * Represents a single Worker Thread instance.
@@ -195,9 +207,9 @@ class SingleWorkerClient extends EventEmitter {
   /**
    * Internal handler for incoming messages from the worker thread.
    * @private
-   * @param {object} message - The message object { requestId, result, error }.
+   * @param {WorkerMessage} message - The message object { requestId, data, error, status }.
    */
-  _handleMessage({ requestId, result, error }) {
+  _handleMessage({ requestId, data, error }) {
     if (this.requestMap.has(requestId)) {
       const { resolve, reject } = this.requestMap.get(requestId);
 
@@ -207,9 +219,9 @@ class SingleWorkerClient extends EventEmitter {
 
       // Settle the promise
       if (error) {
-        reject(new Error(error));
+        reject(new SqliteError(error.message, error.code));
       } else {
-        resolve(result);
+        resolve(data);
       }
     }
   }
@@ -220,6 +232,7 @@ class SingleWorkerClient extends EventEmitter {
    * @param {Error} err
    */
   _handleError(err) {
+    console.log("err hand", err);
     this._flushRequests(err);
   }
 
@@ -241,7 +254,7 @@ class SingleWorkerClient extends EventEmitter {
    */
   _flushRequests(err) {
     this.activeRequests = 0;
-    for (const task of this.requestMap) {
+    for (const [_, task] of this.requestMap) {
       task.reject(err);
     }
     this.requestMap.clear();
@@ -528,30 +541,30 @@ class MultiWorkerClient extends EventEmitter {
   }
 
   /**
-   * Retrieves a Worker ID to lock onto for streaming/sticky sessions.
+   * Retrieves a Worker to lock onto for streaming/sticky sessions.
    *
    * Selection Logic:
    * 1. **Free Worker**: If a worker has 0 requests, return it.
    * 2. **Scale Up**: If no free worker & pool not full, create new one.
    * 3. **Random Fallback**: If full and busy, pick a random worker to distribute load.
    *
-   * @returns {Promise<string>} The UUID of the selected worker.
+   * @returns {Promise<SingleWorkerClient>} Available worker client.
    */
-  async getWorkerId() {
+  async getWorker() {
     // 1. Try to find a completely idle worker
     const freeWorker = this.workers.find((w) => w.isIdle());
-    if (freeWorker) return freeWorker.id;
+    if (freeWorker) return freeWorker;
 
     // 2. If no free worker, but we have capacity, spawn a new one
     if (this.workers.length + this.pendingSpawns < this.maxWorkers) {
       const newWorker = await this._spawnWorker();
-      return newWorker.id;
+      return newWorker;
     }
 
     // 3. Fallback: Select a RANDOM worker (Load distribution for saturated pools)
     // We avoid always picking index 0 to prevent "hot spotting" on the first worker.
     const randomIndex = Math.floor(Math.random() * this.workers.length);
-    return this.workers[randomIndex].id;
+    return this.workers[randomIndex];
   }
 
   /**
