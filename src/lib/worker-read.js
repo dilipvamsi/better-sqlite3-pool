@@ -101,6 +101,37 @@ if (parentPort) {
     /** @param {WorkerPayload} msg */
     ({ id, action, sql, params, streamId, options, fnName, fnString }) => {
       try {
+        // console.log("Read message:", {
+        //   id,
+        //   action,
+        //   sql,
+        //   params,
+        //   options,
+        //   fnName,
+        //   fnString,
+        // });
+
+        // --- Close Database Connection ---
+        if (action === "close") {
+          // 1. Force close any active streams to release locks/resources
+          for (const [sId, session] of activeStreams.entries()) {
+            if (session.iterator && session.iterator.return) {
+              try {
+                session.iterator.return();
+              } catch (e) {}
+            }
+          }
+          activeStreams.clear();
+
+          // 2. Close Database
+          if (db && db.open) {
+            db.close();
+          }
+
+          if (id !== -1) parentPort.postMessage({ id, status: "success" });
+          process.exit(0);
+        }
+
         // --- 1. Handle UDF Registration (Synced from Manager) ---
         if (action === "function") {
           const fn = deserializeFunction(fnString);

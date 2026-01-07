@@ -542,32 +542,70 @@ class Database extends EventEmitter {
 
   /**
    * Close the database connection pool.
-   * Terminates the Writer and all Reader workers.
+   * Sends a graceful close signal to workers to allow SQLite to checkpoint WAL,
+   * then terminates the threads.
    * @returns {Promise<this>}
    */
   async close() {
-    this._ensureOpen();
-    this.open = false;
-    this.emit("close");
-
-    const promises = [];
-
-    // Terminate Readers
-    if (this.readers && this.readers.length > 0) {
-      promises.push(...this.readers.map((r) => r.worker.terminate()));
+    if (!this.open) {
+      return this;
     }
 
-    // Terminate Writer (if exists)
+    const closePayload = { action: "close" };
+    const closePromises = [];
+
+    // 1. Gracefully close Readers
+    // We attempt to send the close message. If the worker is busy or crashed,
+    // we catch the error and proceed to termination.
+    if (this.readers.length > 0) {
+      const readerCloses = this.readers.map((r) =>
+        this._postReader(r, closePayload).catch((err) => {
+          /* Ignore errors if worker is already dead */
+        }),
+      );
+      closePromises.push(...readerCloses);
+    }
+
+    // 2. Gracefully close Writer
     if (this.writer) {
-      promises.push(this.writer.terminate());
+      // bypass _postWriter lock logic to force close, or use raw postMessage if preferred.
+      // However, _postWriter ensures we respect the queue.
+      // If the queue is stuck, we rely on the timeout below.
+      closePromises.push(
+        this._postWriter(closePayload).catch((err) => {
+          /* Ignore errors */
+        }),
+      );
     }
 
-    await Promise.all(promises);
+    // Wait for graceful closures with a hard timeout (e.g., 1 second)
+    // If workers are stuck in long queries, we don't want to hang forever.
+    await Promise.race([
+      Promise.all(closePromises),
+      new Promise((resolve) => setTimeout(resolve, 1000)),
+    ]);
+
+    // 3. Terminate Threads (Hard Cleanup)
+    const terminatePromises = [];
+
+    if (this.readers.length > 0) {
+      terminatePromises.push(...this.readers.map((r) => r.worker.terminate()));
+    }
+
+    if (this.writer) {
+      terminatePromises.push(this.writer.terminate());
+    }
+
+    await Promise.all(terminatePromises);
 
     this.readers = [];
     this.writer = null;
     this.readQueue = [];
     this.writeQueue.clear();
+
+    this.open = false;
+    this.emit("close");
+
     return this;
   }
 

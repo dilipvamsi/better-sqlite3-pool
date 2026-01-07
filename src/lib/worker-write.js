@@ -117,7 +117,25 @@ if (parentPort) {
     "message",
     /** @param {WorkerPayload} msg */
     ({ id, action, sql, params, options, fnName, fnString }) => {
+      // console.log("Write message:", {
+      //   id,
+      //   action,
+      //   sql,
+      //   params,
+      //   options,
+      //   fnName,
+      //   fnString,
+      // });
       try {
+        // --- Close Database Connection ---
+        if (action === "close") {
+          if (db && db.open) {
+            db.close();
+          }
+          if (id !== -1) parentPort.postMessage({ id, status: "success" });
+          process.exit(0);
+        }
+
         // --- 1. Handle UDF Registration ---
         if (action === "function") {
           const fn = deserializeFunction(fnString);

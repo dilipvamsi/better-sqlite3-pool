@@ -30,10 +30,10 @@ const { castRow } = require("./utils");
  * @property {number | bigint} lastInsertRowid - The rowid of the last inserted row.
  */
 
- /**
+/**
  * We import the Database class definition from the parent module.
  * @typedef {import('./database'.Database)} Database
- */ 
+ */
 
 // =============================================================================
 // STATEMENT CLASS
@@ -117,6 +117,7 @@ class Statement {
    * @returns {this}
    */
   bind(...params) {
+    this.db._ensureOpen();
     this.boundParams = params;
     return this;
   }
@@ -133,6 +134,7 @@ class Statement {
    * @returns {Promise<RunResult>}
    */
   async run(...params) {
+    this.db._ensureOpen();
     const p = params.length ? params : this.boundParams;
 
     // Writers handle locking internally via db.writeMutex
@@ -150,6 +152,7 @@ class Statement {
    * @returns {Promise<any[]>} An array of rows.
    */
   async all(...params) {
+    this.db._ensureOpen();
     const p = params.length ? params : this.boundParams;
 
     /** @type {QueryPayload} */
@@ -189,6 +192,7 @@ class Statement {
    * @returns {Promise<any | undefined>} The first row or undefined.
    */
   async get(...params) {
+    this.db._ensureOpen();
     const rows = await this.all(...params);
     return rows ? rows[0] : undefined;
   }
@@ -200,6 +204,7 @@ class Statement {
    * @returns {AsyncIterableIterator<any>}
    */
   async *iterate(...params) {
+    this.db._ensureOpen();
     const p = params.length ? params : this.boundParams;
 
     // --- FALLBACK: IN-MEMORY MODE ---
