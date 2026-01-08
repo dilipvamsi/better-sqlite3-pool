@@ -21,6 +21,7 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
  * @property {boolean} [fileMustExist] - If true, throws if the database file does not exist.
  * @property {number} [timeout] - The number of milliseconds to wait when locking the database.
  * @property {string} [nativeBinding] - Path to the native addon executable.
+ * @property {boolean} [verbose] - If true, logs are sent.
  */
 
 /** @typedef {import('better-sqlite3-multiple-ciphers').Database} DatabaseInstance */
@@ -62,7 +63,7 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
 
 /**
  * All possible action strings.
- * @typedef {'run' | 'get' | 'all' | 'exec' | 'stream_open' | 'stream_next' | 'stream_close' | 'pragma' | 'function' | 'aggregate' | 'key' | 'rekey' | 'load_extension' | 'serialize' | 'close'} WorkerAction
+ * @typedef {'run' | 'get' | 'all' | 'exec' | 'iterator_open' | 'iterator_next' | 'iterator_close' | 'pragma' | 'function' | 'aggregate' | 'key' | 'rekey' | 'load_extension' | 'serialize' | 'close'} WorkerAction
  */
 
 // =============================================================================
@@ -76,8 +77,8 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
  */
 
 /**
- * @typedef {Object} ResultStream
- * @property {string} streamId
+ * @typedef {Object} ResultIterator
+ * @property {string} iteratorId
  * @property {Array<any>} rows
  * @property {ColumnDefinition[]} [columns]
  * @property {boolean} done
@@ -120,24 +121,24 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
  */
 
 /**
- * @typedef {Object} PayloadStreamOpen
- * @property {'stream_open'} action
- * @property {string} streamId
+ * @typedef {Object} PayloadIteratorOpen
+ * @property {'iterator_open'} action
+ * @property {string} iteratorId
  * @property {string} sql
  * @property {Array<any>|Object} [params]
  * @property {StatementOptions} [options]
  */
 
 /**
- * @typedef {Object} PayloadStreamNext
- * @property {'stream_next'} action
- * @property {string} streamId
+ * @typedef {Object} PayloadIteratorNext
+ * @property {'iterator_next'} action
+ * @property {string} iteratorId
  */
 
 /**
- * @typedef {Object} PayloadStreamClose
- * @property {'stream_close'} action
- * @property {string} streamId
+ * @typedef {Object} PayloadIteratorClose
+ * @property {'iterator_close'} action
+ * @property {string} iteratorId
  */
 
 /**
@@ -175,7 +176,7 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
  */
 
 /**
- * @typedef {Object} PayloadLoadExtension
+ * @typedef {Object} Payloadload_extension
  * @property {'load_extension'} action
  * @property {string} path
  */
@@ -202,7 +203,7 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
 
 /**
  * @typedef {Object} PayloadUnsafeMode
- * @property {'unsafeMode'} action
+ * @property {'unsafe_mode'} action
  * @property {boolean} on
  */
 
@@ -212,8 +213,14 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
  */
 
 /**
+ * @typedef {Object} PayloadDefaultSafeIntegers
+ * @property {'default_safe_integers'} action
+ * @property {boolean} state
+ */
+
+/**
  * Union of all Request Payloads.
- * @typedef {PayloadRun | PayloadRead | PayloadExec | PayloadStreamOpen | PayloadStreamNext | PayloadStreamClose | PayloadPragma | PayloadFunction | PayloadAggregate | PayloadKey | PayloadRekey | PayloadLoadExtension | PayloadSerialize | PayloadBackup | PayloadTable | PayloadUnsafeMode | PayloadClose} WorkerRequestPayload
+ * @typedef {PayloadRun | PayloadRead | PayloadExec | PayloadIteratorOpen | PayloadIteratorNext | PayloadIteratorClose | PayloadPragma | PayloadFunction | PayloadAggregate | PayloadKey | PayloadRekey | Payloadload_extension | PayloadSerialize | PayloadBackup | PayloadTable | PayloadUnsafeMode | PayloadClose | PayloadDefaultSafeIntegers} WorkerRequestPayload
  */
 
 /**
@@ -243,11 +250,11 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
  */
 
 /**
- * @typedef {Object} ResponseStream
+ * @typedef {Object} ResponseIterator
  * @property {string} requestId
- * @property {'stream_open' | 'stream_next'} action
+ * @property {'iterator_open' | 'iterator_next'} action
  * @property {'success'} status
- * @property {ResultStream} data
+ * @property {ResultIterator} data
  */
 
 /**
@@ -285,7 +292,7 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
 /**
  * @typedef {Object} ResponseVoid
  * @property {string} requestId
- * @property {'exec' | 'close' | 'function' | 'aggregate' | 'stream_close' | 'key' | 'rekey' | 'loadExtension'} action
+ * @property {'exec' | 'close' | 'function' | 'aggregate' | 'iterator_close' | 'key' | 'rekey' | 'load_extension'} action
  * @property {'success'} status
  */
 
@@ -308,7 +315,7 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
 
 /**
  * Unified Response Type
- * @typedef {ResponseRun | ResponseRead | ResponseStream | ResponsePragma | ResponseSerialize | ResponseVoid | ResponseError | ResponseBackup| ResponseBackupProgress} WorkerResponse
+ * @typedef {ResponseRun | ResponseRead | ResponseIterator | ResponsePragma | ResponseSerialize | ResponseVoid | ResponseError | ResponseBackup| ResponseBackupProgress} WorkerResponse
  */
 
 // =============================================================================
@@ -316,7 +323,8 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
 // =============================================================================
 
 /** @type {WorkerData} */
-const { filename, fileMustExist, timeout, nativeBinding, mode } = workerData;
+const { filename, fileMustExist, timeout, nativeBinding, mode, verbose } =
+  workerData;
 
 // console.log(`[Worker:${mode}] Starting... DB: ${filename}`);
 
@@ -328,21 +336,31 @@ const isMemory = filename === ":memory:" || filename === "";
 /** @type {DatabaseInstance} */
 let db;
 
+const options = {};
+
+if (verbose) {
+  options.verbose = (message) => {
+    // Send log back to parent with correlation ID
+    parentPort.postMessage({
+      requestId: currentRequestId,
+      status: "log",
+      data: message,
+    });
+  };
+}
+// 1. Configure Mode-Specific Options
+if (!isWriter) {
+  // Readers must strictly be Read-Only
+  options.readonly = true;
+}
+
+if (fileMustExist) options.fileMustExist = true;
+if (nativeBinding) options.nativeBinding = nativeBinding;
+
+// Default timeout prevents immediate failures if DB is locked by another process
+options.timeout = timeout !== undefined ? timeout : 5000;
+
 try {
-  const options = {};
-
-  // 1. Configure Mode-Specific Options
-  if (!isWriter) {
-    // Readers must strictly be Read-Only
-    options.readonly = true;
-  }
-
-  if (fileMustExist) options.fileMustExist = true;
-  if (nativeBinding) options.nativeBinding = nativeBinding;
-
-  // Default timeout prevents immediate failures if DB is locked by another process
-  options.timeout = timeout !== undefined ? timeout : 5000;
-
   db = new Database(filename, options);
 } catch (err) {
   // Report initialization error to pool
@@ -460,7 +478,7 @@ function handleMessage({ requestId, data }) {
         break;
       }
       case "load_extension": {
-        processLoadExtension(data);
+        processload_extension(data);
         /** @type {ResponseVoid} */
         const res = { requestId, action: "load_extension", status: "success" };
         parentPort.postMessage(res);
@@ -490,41 +508,52 @@ function handleMessage({ requestId, data }) {
         parentPort.postMessage(res);
         break;
       }
-      case "unsafeMode": {
+      case "unsafe_mode": {
         processUnsafeMode(data);
         /** @type {ResponseVoid} */
-        const res = { requestId, action: "unsafeMode", status: "success" };
+        const res = { requestId, action: "unsafe_mode", status: "success" };
         parentPort.postMessage(res);
         break;
       }
-      case "stream_open": {
-        const result = processStreamOpen(data);
-        /** @type {ResponseStream} */
-        const res = {
-          requestId,
-          action: "stream_open",
-          status: "success",
-          data: result,
-        };
-        parentPort.postMessage(res);
-        break;
-      }
-      case "stream_next": {
-        const result = processStreamNext(data);
-        /** @type {ResponseStream} */
-        const res = {
-          requestId,
-          action: "stream_next",
-          status: "success",
-          data: result,
-        };
-        parentPort.postMessage(res);
-        break;
-      }
-      case "stream_close": {
-        processStreamClose(data);
+      case "default_safe_integers": {
+        processDefaultSafeIntegers(data);
         /** @type {ResponseVoid} */
-        const res = { requestId, action: "stream_close", status: "success" };
+        const res = {
+          requestId,
+          action: "defaultSafeIntegers",
+          status: "success",
+        };
+        parentPort.postMessage(res);
+        break;
+      }
+      case "iterator_open": {
+        const result = processIteratorOpen(data);
+        /** @type {ResponseIterator} */
+        const res = {
+          requestId,
+          action: "iterator_open",
+          status: "success",
+          data: result,
+        };
+        parentPort.postMessage(res);
+        break;
+      }
+      case "iterator_next": {
+        const result = processIteratorNext(data);
+        /** @type {ResponseIterator} */
+        const res = {
+          requestId,
+          action: "iterator_next",
+          status: "success",
+          data: result,
+        };
+        parentPort.postMessage(res);
+        break;
+      }
+      case "iterator_close": {
+        processIteratorClose(data);
+        /** @type {ResponseVoid} */
+        const res = { requestId, action: "iterator_close", status: "success" };
         parentPort.postMessage(res);
         break;
       }
@@ -641,9 +670,14 @@ function processRekey(payload) {
   db.rekey(payload.key);
 }
 
-/** @param {PayloadLoadExtension} payload */
-function processLoadExtension(payload) {
+/** @param {Payloadload_extension} payload */
+function processload_extension(payload) {
   db.loadExtension(payload.path);
+}
+
+/** @param {PayloadDefaultSafeIntegers} payload */
+function processDefaultSafeIntegers(payload) {
+  db.defaultSafeIntegers(payload.state);
 }
 
 /**
@@ -716,40 +750,40 @@ function processUnsafeMode(payload) {
 }
 
 /**
- * Handles 'stream_open'.
- * @param {PayloadStreamOpen} payload
- * @returns {ResultStream}
+ * Handles 'iterator_open'.
+ * @param {PayloadIteratorOpen} payload
+ * @returns {ResultIterator}
  */
-function processStreamOpen(payload) {
+function processIteratorOpen(payload) {
   const stmt = prepareStatement(payload.sql, payload.options);
   const iterator = stmt.iterate(...(payload.params || []));
-  activeStreams.set(payload.streamId, iterator);
+  activeStreams.set(payload.iteratorId, iterator);
 
   const includeColumns = !(payload.options?.raw || payload.options?.pluck);
   const columns = includeColumns ? stmt.columns() : undefined;
 
-  return getStreamBatch(payload.streamId, iterator, columns);
+  return getStreamBatch(payload.iteratorId, iterator, columns);
 }
 
 /**
- * Handles 'stream_next'.
- * @param {PayloadStreamNext} payload
- * @returns {ResultStream}
+ * Handles 'iterator_next'.
+ * @param {PayloadIteratorNext} payload
+ * @returns {ResultIterator}
  */
-function processStreamNext(payload) {
-  const iterator = activeStreams.get(payload.streamId);
+function processIteratorNext(payload) {
+  const iterator = activeStreams.get(payload.iteratorId);
   if (!iterator) {
-    return { streamId: payload.streamId, rows: [], done: true };
+    return { iteratorId: payload.iteratorId, rows: [], done: true };
   }
-  return getStreamBatch(payload.streamId, iterator, undefined);
+  return getStreamBatch(payload.iteratorId, iterator, undefined);
 }
 
 /**
- * Handles 'stream_close'.
- * @param {PayloadStreamClose} payload
+ * Handles 'iterator_close'.
+ * @param {PayloadIteratorClose} payload
  */
-function processStreamClose(payload) {
-  closeStream(payload.streamId);
+function processIteratorClose(payload) {
+  closeIterator(payload.iteratorId);
 }
 
 /**
@@ -806,12 +840,12 @@ function prepareStatement(sql, options) {
 
 /**
  * Fetches a batch of rows from an iterator.
- * @param {string} streamId
+ * @param {string} iteratorId
  * @param {Iterator<unknown>} iterator
  * @param {ColumnDefinition[]} [columns]
- * @returns {ResultStream}
+ * @returns {ResultIterator}
  */
-function getStreamBatch(streamId, iterator, columns) {
+function getStreamBatch(iteratorId, iterator, columns) {
   const BATCH_SIZE = 50;
   const rows = [];
   let done = false;
@@ -826,20 +860,20 @@ function getStreamBatch(streamId, iterator, columns) {
       rows.push(next.value);
     }
   } catch (err) {
-    closeStream(streamId);
+    closeIterator(iteratorId);
     throw err;
   }
 
-  if (done) activeStreams.delete(streamId);
+  if (done) activeStreams.delete(iteratorId);
 
-  return { streamId, rows, columns, done };
+  return { iteratorId, rows, columns, done };
 }
 
 /**
- * @param {string} streamId
+ * @param {string} iteratorId
  */
-function closeStream(streamId) {
-  const iterator = activeStreams.get(streamId);
+function closeIterator(iteratorId) {
+  const iterator = activeStreams.get(iteratorId);
   if (iterator && iterator.return) {
     try {
       iterator.return();
@@ -847,12 +881,12 @@ function closeStream(streamId) {
       /* ignore */
     }
   }
-  activeStreams.delete(streamId);
+  activeStreams.delete(iteratorId);
 }
 
 function cleanupStreams() {
-  for (const streamId of activeStreams.keys()) {
-    closeStream(streamId);
+  for (const iteratorId of activeStreams.keys()) {
+    closeIterator(iteratorId);
   }
 }
 

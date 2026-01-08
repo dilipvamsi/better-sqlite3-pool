@@ -52,6 +52,14 @@ const kMultiWorker = Symbol("MultiWorker");
  */
 
 /**
+ * @typedef {Object} LogMessage
+ * @description The versbose log message received.
+ * @property {string} requestId - Unique ID correlating to a pending promise.
+ * @property {'log'} status - Outcome status.
+ * @property {any} [data] - Message data.
+ */
+
+/**
  * @typedef {Object} StreamContext
  * @description Internal state for managing the Async Iterator bridge during streaming.
  * @property {any[]} buffer - Queue of received data chunks not yet yielded.
@@ -78,6 +86,24 @@ const kMultiWorker = Symbol("MultiWorker");
  * @property {Function} reject - Outer promise rejecter.
  */
 
+/**
+ * @typedef {Object} WorkerConfig
+ * @property {string} filename - Filename of the database file.
+ * @property {boolean} [readonly] - Flag indicating if the database should be opened in read-only mode.
+ * @property {boolean} [fileMustExist] - Flag indicating if the database file must exist.
+ * @property {number} [timeout] - Timeout in milliseconds for database operations.
+ * @property {string} [nativeBinding] - Path to the native binding file.
+ * @property {boolean} [verbose] - Flag indicating if verbose logging should be enabled.
+ */
+
+/**
+ * Worker Client Options
+ * @typedef {Object} WorkerClientOptions
+ * @property {WorkerConfig & {mode: 'read' | 'write'}} workerData - Worker configuration data.
+ * @property {boolean} useMutex - Flag indicating if mutex should be used.
+ * @property {(message: LogMessage) => void | undefined} onLog - Callback function for logging messages.
+ */
+
 // =============================================================================
 // 1. SINGLE WORKER CLIENT
 // =============================================================================
@@ -93,7 +119,7 @@ class SingleWorkerClient extends EventEmitter {
    * PRIVATE CONSTRUCTOR.
    * @param {Symbol} token - Internal security token.
    * @param {string} workerPath - The absolute or relative path to the worker script.
-   * @param {WorkerOptions & {useMutex: boolean}} workerOptions - Options for the Worker instance.
+   * @param {WorkerClientOptions} workerOptions - Options for the Worker instance.
    * @throws {ReferenceError} If called directly without the correct token.
    */
   constructor(token, workerPath, workerOptions) {
@@ -104,7 +130,7 @@ class SingleWorkerClient extends EventEmitter {
     }
     super();
 
-    const { useMutex, ...nodeWorkerOpts } = workerOptions;
+    const { useMutex, onLog, ...nodeWorkerOpts } = workerOptions;
 
     /** @type {string} Generate a simple lightweight ID for the worker itself. */
     this.id = "w_" + Math.random().toString(36).slice(2, 7);
@@ -139,17 +165,21 @@ class SingleWorkerClient extends EventEmitter {
     /** @type {Mutex | null} If useMutex is true, we enforce sequential execution for this worker */
     this.mutex = useMutex ? new Mutex() : null;
 
+    /** @type {(msg: any) => void} logger callback for database verbose logs */
+    this.onLog = onLog || null;
+
     // Bind event handlers to maintain 'this' context
     this.worker.on("message", this._handleMessage.bind(this));
     this.worker.on("error", this._handleError.bind(this));
     this.worker.on("exit", this._handleExit.bind(this));
   }
+
   /**
    * Static Factory Method.
    * Creates the instance and waits for the worker to be online.
    *
    * @param {string} workerPath
-   * @param {WorkerOptions} workerOptions - Options for the Worker instance.
+   * @param {WorkerClientOptions} workerOptions - Options for the Worker instance.
    * @param {(client: SingleWorkerClient) => Promise<void>} [initFn] - Async function(worker) => Promise<void>
    * @returns {Promise<SingleWorkerClient>}
    */
@@ -387,6 +417,14 @@ class SingleWorkerClient extends EventEmitter {
    * @param {WorkerMessage} message - The worker message.
    */
   _handleMessage({ requestId, status, data, error }) {
+    // --- CASE 0: LOGGING (Global, not strictly tied to request state) ---
+    if (status === "log") {
+      if (typeof this.onLog === "function") {
+        this.onLog(data);
+      }
+      return;
+    }
+
     if (!this.requestMap.has(requestId)) return;
     const task = this.requestMap.get(requestId);
 
@@ -522,7 +560,7 @@ class MultiWorkerClient extends EventEmitter {
    * @param {string} workerPath - Path to the worker file.
    * @param {number} [minWorkers=1] - Minimum number of workers to keep alive.
    * @param {number} [maxWorkers=2] - Maximum number of workers allowed.
-   * @param {WorkerOptions | & {useMutex: boolean}} [WorkerOptions] - Options for the worker.
+   * @param {WorkerClientOptions} [WorkerOptions] - Options for the worker.
    * @param {Function} [initFn] - Function executed on every new worker (init/scale).
    * @throws {ReferenceError} If called directly.
    */

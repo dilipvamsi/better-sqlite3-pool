@@ -7,13 +7,11 @@
  */
 
 const { AsyncLocalStorage } = require("node:async_hooks");
-const { Worker } = require("node:worker_threads");
+const { SqliteError } = require("better-sqlite3-multiple-ciphers");
 const path = require("node:path");
 const EventEmitter = require("events");
-const Mutex = require("./mutex");
 const Statement = require("./statement");
 const { createError, fileExists, parentDirectoryExists } = require("./utils");
-const { SqliteError } = require("better-sqlite3-multiple-ciphers");
 const { SingleWorkerClient, MultiWorkerClient } = require("./worker-pool");
 
 // =============================================================================
@@ -33,16 +31,7 @@ const { SingleWorkerClient, MultiWorkerClient } = require("./worker-pool");
  * @property {boolean} [fileMustExist=false] - If true, throws if the database file does not exist.
  * @property {number} [timeout=5000] - The number of milliseconds to wait when locking the database.
  * @property {string} [nativeBinding] - Path to the native addon executable.
- * @property {Function} [verbose] - (Not supported in threaded mode).
- */
-
-/**
- * @typedef {Object} WorkerConfig
- * @property {string} filename
- * @property {boolean} readonly
- * @property {boolean} fileMustExist
- * @property {number} timeout
- * @property {string} [nativeBinding]
+ * @property {Function} [verbose] - (Verbose logging function).
  */
 
 // =============================================================================
@@ -222,6 +211,7 @@ class Database extends EventEmitter {
       nativeBinding: options.nativeBinding,
       minReaders,
       maxReaders,
+      verbose: options.verbose,
     };
 
     /** * Indicates if the database is open and fully initialized.
@@ -239,13 +229,19 @@ class Database extends EventEmitter {
 
     // --- WORKER CONFIGURATION ---
     // Prepare the payload that goes to every worker
+    /** @type {WorkerConfig} */
     this._workerConfig = {
       filename: this.name,
       readonly: this.readonly,
       fileMustExist: this.options.fileMustExist,
       timeout: this.options.timeout,
       nativeBinding: this.options.nativeBinding,
+      verbose: !!this.options.verbose,
     };
+
+    /** @type {Function|undefined} */
+    this.verbose =
+      typeof options.verbose === "function" ? options.verbose : undefined;
 
     /** @type {AsyncLocalStorage} - Stores the async context of the transaction. */
     this.transactionContext = new AsyncLocalStorage();
@@ -267,6 +263,13 @@ class Database extends EventEmitter {
    * @private
    */
   async _init() {
+    // Define the log handler that routes worker logs to the user's function
+    const onLog = this.verbose
+      ? (msg) => {
+          if (this.verbose) this.verbose(msg);
+        }
+      : undefined;
+
     // 1. Initialize Writer (if not readonly)
     // The Writer MUST start first to create the WAL/SHM files.
     if (!this.readonly) {
@@ -275,6 +278,7 @@ class Database extends EventEmitter {
         {
           workerData: { ...this._workerConfig, mode: "write" },
           useMutex: true, // <--- CRITICAL: Transactions/Writes must be serialized.
+          onLog,
         },
         this._workerInitCheck, // Custom hook to wait for "ready" message
       );
@@ -290,6 +294,7 @@ class Database extends EventEmitter {
         {
           workerData: { ...this._workerConfig, mode: "read" },
           useMutex: false, // <--- CRITICAL: Readers must be parallel. No Mutex.
+          onLog,
         },
         this._workerInitCheck, // Custom hook to wait for "ready" message per worker
       );
@@ -497,6 +502,24 @@ class Database extends EventEmitter {
     if (this.writer) promises.push(this.writer.execute(payload));
 
     await Promise.all(promises);
+  }
+
+  /**
+   * Toggle default BigInt support for the database.
+   * Broadcasts the setting to all workers.
+   * @param {boolean} [toggleState=true]
+   */
+  async defaultSafeIntegers(toggleState = true) {
+    this._ensureOpen();
+    const payload = { action: "defaultSafeIntegers", state: toggleState };
+
+    const promises = [];
+    if (this.readerPool)
+      promises.push(this.readerPool.broadcast(payload, true));
+    if (this.writer) promises.push(this.writer.execute(payload));
+
+    await Promise.all(promises);
+    return this;
   }
 
   /**
@@ -708,7 +731,7 @@ class Database extends EventEmitter {
    */
   async unsafeMode(unsafe = true) {
     this._ensureOpen();
-    const payload = { action: "unsafeMode", on: unsafe };
+    const payload = { action: "unsafe_mode", on: unsafe };
     const promises = [];
     if (this.readerPool) {
       promises.push(this.readerPool.broadcast(payload, true));

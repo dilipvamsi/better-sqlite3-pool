@@ -6,6 +6,7 @@
 
 const { castRow } = require("./utils");
 const { SingleWorkerClient } = require("./worker-pool");
+const { SqliteError } = require("better-sqlite3-multiple-ciphers");
 
 // =============================================================================
 // TYPE DEFINITIONS
@@ -52,13 +53,26 @@ class Statement {
     /** @type {string} The SQL source string. */
     this.source = sql;
 
+    // --- PARSING LOGIC (Heuristic) ---
+    // 1. Is it a SELECT or EXPLAIN?
+    const isSelect = /^\s*(SELECT|EXPLAIN)/i.test(sql);
+    // 2. Does it use the RETURNING clause? (Writes data but returns rows)
+    const hasReturning = /RETURNING/i.test(sql);
+
     /**
      * @type {boolean}
      * Heuristic to determine if this is a Read-Only query.
      * We exclude 'RETURNING' clauses because they write data (INSERT/UPDATE/DELETE)
      * but return rows like a SELECT.
      */
-    this.reader = /^\s*(SELECT|EXPLAIN)/i.test(sql) && !/RETURNING/i.test(sql);
+    this.readonly = isSelect && !hasReturning;
+
+    /**
+     * @type {boolean}
+     * READER: True if it returns rows (SELECT, EXPLAIN, or INSERT...RETURNING).
+     * Used for API validation: .get()/.all() are valid if this is true.
+     */
+    this.reader = isSelect || hasReturning;
 
     /** @type {Array<any>} Default parameters bound via .bind() */
     this.boundParams = [];
@@ -72,6 +86,43 @@ class Statement {
     this._expand = false;
     /** @type {boolean | undefined} Safe integers as BigInts. */
     this._safeIntegers = undefined;
+
+    /** @type {import('better-sqlite3-multiple-ciphers').ColumnDefinition[]} */
+    this._columns = [];
+
+    /** @type {boolean} */
+    this._busy = false;
+
+    /**
+     * Flag to track if the statement has been executed at least once.
+     * Required because column metadata is fetched asynchronously.
+     * @type {boolean}
+     */
+    this._hasExecuted = false;
+  }
+
+  get database() {
+    return this.db;
+  }
+  /**
+   * Returns true if the statement is currently being iterated.
+   */
+  get busy() {
+    return this._busy;
+  }
+
+  /**
+   * Returns the column metadata.
+   * @throws {SqliteError} If accessed before the statement has been executed.
+   */
+  columns() {
+    if (!this._hasExecuted) {
+      throw new SqliteError(
+        "The statement has not been executed yet. Column metadata is only available after the first execution in threaded mode.",
+        "SQLITE_MISUSE",
+      );
+    }
+    return this._columns;
   }
 
   // ===========================================================================
@@ -142,14 +193,24 @@ class Statement {
    */
   async run(...params) {
     this.db._ensureOpen();
-    const p = params.length ? params : this.boundParams;
+
+    if (this.reader && !this.readonly && !this._pluck && !this._raw) {
+      // Edge case: INSERT RETURNING called with .run()
+      // better-sqlite3 allows this but discards rows. We treat it normally.
+    }
+
+    const stmtParms = params.length ? params : this.boundParams;
 
     // Writers handle locking internally via db.writeMutex
-    return this.db._requestWrite("run", {
+    const result = await this.db._requestWrite("run", {
       sql: this.source,
-      params: p,
+      params: stmtParms,
       options: this._getOptions(),
     });
+
+    // run() doesn't typically return columns, but we mark execution as done.
+    this._hasExecuted = true;
+    return result;
   }
 
   /**
@@ -160,12 +221,12 @@ class Statement {
    */
   async all(...params) {
     this.db._ensureOpen();
-    const p = params.length ? params : this.boundParams;
+    const stmtParams = params.length ? params : this.boundParams;
 
     /** @type {QueryPayload} */
     const payload = {
       sql: this.source,
-      params: p,
+      params: stmtParams,
       options: this._getOptions(),
     };
 
@@ -175,11 +236,17 @@ class Statement {
     // 1. Transaction: Must use Writer (Reader workers don't see uncommitted data).
     // 2. Write Query: Queries with RETURNING (INSERT..RETURNING) must go to Writer.
     // 3. Memory DB: Only Writer exists (Readers are disabled).
-    if (this.db.inTransaction || !this.reader || this.db.memory) {
+    if (this.db.inTransaction || !this.readonly || this.db.memory) {
       result = await this.db._requestWrite("all", payload);
     } else {
       result = await this.db._requestRead("all", payload);
     }
+
+    // Capture columns from worker response
+    if (result.columns) {
+      this._columns = result.columns;
+    }
+    this._hasExecuted = true;
 
     // --- POST-PROCESSING ---
     // better-sqlite3 returns raw data from workers. We must cast BigInts/Buffers
@@ -225,8 +292,10 @@ class Statement {
     /** @type {SingleWorkerClient} */
     let workerClient;
 
-    if (this.db.inTransaction || !this.reader) {
-      if (!this.db.writer) throw new Error("No writer available");
+    if (this.db.inTransaction || !this.readonly) {
+      if (!this.db.writer) {
+        throw new SqliteError("No writer available", "SQLITE_MISUSE");
+      }
       workerClient = this.db.writer;
     } else {
       workerClient = await this.db.readerPool.getWorker();
@@ -235,20 +304,27 @@ class Statement {
     // LOCK THE WORKER
     await workerClient.lock();
 
-    const streamId = Math.random().toString(36).slice(2);
+    const iteratorId = Math.random().toString(36).slice(2);
     let columns = null;
+
+    this._busy = true; // Mark busy
 
     try {
       // 1. OPEN STREAM (Get first batch)
       let result = await workerClient.noLockExecute({
-        action: "stream_open",
-        streamId,
+        action: "iterator_open",
+        iteratorId,
         sql: this.source,
         params: stmtParams,
         options: this._getOptions(),
       });
 
-      if (result.columns) columns = result.columns;
+      // Capture columns from first batch
+      if (result.columns) {
+        columns = result.columns;
+        this._columns = result.columns;
+      }
+      this._hasExecuted = true;
 
       // Process and yield first batch
       if (result.rows && result.rows.length > 0) {
@@ -267,8 +343,8 @@ class Statement {
       while (!result.done) {
         // Request next batch
         result = await workerClient.noLockExecute({
-          action: "stream_next",
-          streamId,
+          action: "iterator_next",
+          iteratorId,
         });
 
         if (result.rows && result.rows.length > 0) {
@@ -283,8 +359,9 @@ class Statement {
       }
     } finally {
       // 3. CLEANUP
+      this._busy = false; // Mark not busy
       workerClient
-        .execute({ action: "stream_close", streamId })
+        .execute({ action: "iterator_close", iteratorId })
         .catch(() => {});
       workerClient.unlock();
     }
