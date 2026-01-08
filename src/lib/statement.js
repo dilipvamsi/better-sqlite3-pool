@@ -20,6 +20,7 @@ const { SingleWorkerClient } = require("./worker-pool");
  * @property {boolean} pluck - If true, returns only the first column.
  * @property {boolean} raw - If true, returns raw arrays instead of objects.
  * @property {boolean} expand - If true, expands dot-notation keys into nested objects.
+ * @property {boolean} [safeIntegers] - If true, returns integers as BigInts.
  */
 
 /**
@@ -69,6 +70,8 @@ class Statement {
     this._raw = false;
     /** @type {boolean} Expand 'table.col' keys into nested objects { table: { col: val } }. */
     this._expand = false;
+    /** @type {boolean | undefined} Safe integers as BigInts. */
+    this._safeIntegers = undefined;
   }
 
   // ===========================================================================
@@ -102,6 +105,16 @@ class Statement {
    */
   expand(toggle = true) {
     this._expand = toggle;
+    return this;
+  }
+
+  /**
+   * Toggle BigInt support for this statement.
+   * @param {boolean} [toggle=true]
+   * @returns {this}
+   */
+  safeIntegers(toggle = true) {
+    this._safeIntegers = toggle;
     return this;
   }
 
@@ -287,7 +300,12 @@ class Statement {
    * @private
    */
   _getOptions() {
-    return { pluck: this._pluck, raw: this._raw, expand: this._expand };
+    return {
+      pluck: this._pluck,
+      raw: this._raw,
+      expand: this._expand,
+      safeIntegers: this._safeIntegers,
+    };
   }
 }
 

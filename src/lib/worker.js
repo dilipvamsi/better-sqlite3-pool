@@ -29,6 +29,9 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
 /** @typedef {import('better-sqlite3-multiple-ciphers').ColumnDefinition} ColumnDefinition */
 /** @typedef {import('better-sqlite3-multiple-ciphers').SqliteError} SqliteError */
 /** @typedef {import('better-sqlite3-multiple-ciphers').Statement} Statement */
+/** @typedef {import('better-sqlite3-multiple-ciphers').Database.SerializeOptions} SerializeOptions */
+/** @typedef {import('better-sqlite3-multiple-ciphers').Database.BackupOptions} BackupOptions */
+/** @typedef {import('better-sqlite3-multiple-ciphers').Database.BackupMetadata} BackupMetadata */
 
 // --- SHARED UTILITIES ---
 
@@ -83,6 +86,11 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
 /**
  * @typedef {Object} ResultPragma
  * @property {unknown} pragma
+ */
+
+/**
+ * @typedef {Object} ResultSerialize
+ * @property {Buffer} buffer
  */
 
 // =============================================================================
@@ -179,13 +187,39 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
  */
 
 /**
+ * @typedef {Object} PayloadBackup
+ * @property {'backup'} action
+ * @property {string} filename
+ * @property {BackupOptions} [options]
+ */
+
+/**
+ * @typedef {Object} PayloadTable
+ * @property {'table'} action
+ * @property {string} name
+ * @property {string} factoryString
+ */
+
+/**
+ * @typedef {Object} PayloadUnsafeMode
+ * @property {'unsafeMode'} action
+ * @property {boolean} on
+ */
+
+/**
  * @typedef {Object} PayloadClose
  * @property {'close'} action
  */
 
 /**
  * Union of all Request Payloads.
- * @typedef {PayloadRun | PayloadRead | PayloadExec | PayloadStreamOpen | PayloadStreamNext | PayloadStreamClose | PayloadPragma | PayloadFunction | PayloadAggregate | PayloadKey | PayloadRekey | PayloadLoadExtension | PayloadSerialize | PayloadClose} WorkerRequestPayload
+ * @typedef {PayloadRun | PayloadRead | PayloadExec | PayloadStreamOpen | PayloadStreamNext | PayloadStreamClose | PayloadPragma | PayloadFunction | PayloadAggregate | PayloadKey | PayloadRekey | PayloadLoadExtension | PayloadSerialize | PayloadBackup | PayloadTable | PayloadUnsafeMode | PayloadClose} WorkerRequestPayload
+ */
+
+/**
+ * @typedef {Object} WorkerRequest
+ * @property {string} requestId
+ * @property {WorkerRequestPayload} data
  */
 
 // =============================================================================
@@ -233,6 +267,22 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
  */
 
 /**
+ * @typedef {Object} ResponseBackup
+ * @property {string} requestId
+ * @property {'backup'} action
+ * @property {'done'} status
+ * @property {ResultBackup} data
+ */
+
+/**
+ * @typedef {Object} ResponseBackupProgress
+ * @property {string} requestId
+ * @property {'backup'} action
+ * @property {'next'} status
+ * @property {BackupMetadata} data
+ */
+
+/**
  * @typedef {Object} ResponseVoid
  * @property {string} requestId
  * @property {'exec' | 'close' | 'function' | 'aggregate' | 'stream_close' | 'key' | 'rekey' | 'loadExtension'} action
@@ -248,8 +298,17 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
  */
 
 /**
+ * @typedef {Object} ResponseProgress
+ * @description Generic streaming progress response.
+ * @property {string} requestId
+ * @property {string} action
+ * @property {'next'} status
+ * @property {any} data
+ */
+
+/**
  * Unified Response Type
- * @typedef {ResponseRun | ResponseRead | ResponseStream | ResponsePragma | ResponseSerialize | ResponseVoid | ResponseError} WorkerResponse
+ * @typedef {ResponseRun | ResponseRead | ResponseStream | ResponsePragma | ResponseSerialize | ResponseVoid | ResponseError | ResponseBackup| ResponseBackupProgress} WorkerResponse
  */
 
 // =============================================================================
@@ -419,6 +478,25 @@ function handleMessage({ requestId, data }) {
         parentPort.postMessage(res);
         break;
       }
+      case "backup": {
+        // Streamed response handled inside
+        processBackup(requestId, data);
+        break;
+      }
+      case "table": {
+        processTable(data);
+        /** @type {ResponseVoid} */
+        const res = { requestId, action: "table", status: "success" };
+        parentPort.postMessage(res);
+        break;
+      }
+      case "unsafeMode": {
+        processUnsafeMode(data);
+        /** @type {ResponseVoid} */
+        const res = { requestId, action: "unsafeMode", status: "success" };
+        parentPort.postMessage(res);
+        break;
+      }
       case "stream_open": {
         const result = processStreamOpen(data);
         /** @type {ResponseStream} */
@@ -576,6 +654,67 @@ function processSerialize(payload) {
   const buffer = db.serialize(payload.options);
   return { buffer };
 }
+
+/**
+ * Handles backup. Note: This sends its own messages.
+ * @param {string} requestId
+ * @param {PayloadBackup} payload
+ */
+async function processBackup(requestId, payload) {
+  try {
+    const { filename, options } = payload;
+    const backupOpts = { ...options };
+
+    // Intercept progress callback to stream updates
+    backupOpts.progress = (info) => {
+      /** @type {ResponseBackupProgress} */
+      const progressMsg = {
+        requestId,
+        action: "backup",
+        status: "next",
+        data: info,
+      };
+      parentPort.postMessage(progressMsg);
+
+      // Throttle backup to allow event loop to breathe
+      return 50;
+    };
+
+    const result = await db.backup(filename, backupOpts);
+
+    /** @type {ResponseBackup} */
+    const res = {
+      requestId,
+      action: "backup",
+      status: "done",
+      data: result,
+    };
+    parentPort.postMessage(res);
+  } catch (err) {
+    /** @type {ResponseError} */
+    const res = {
+      requestId,
+      action: "backup",
+      status: "error",
+      error: formatError(err),
+    };
+    parentPort.postMessage(res);
+  }
+}
+
+/** @param {PayloadTable} payload */
+function processTable(payload) {
+  const factory = deserializeFunction(payload.factoryString);
+  // Execute factory to get table options
+  const tableOpts = factory();
+  db.table(payload.name, tableOpts);
+}
+
+/** @param {PayloadUnsafeMode} payload */
+function processUnsafeMode(payload) {
+  db.unsafeMode(payload.on);
+}
+
 /**
  * Handles 'stream_open'.
  * @param {PayloadStreamOpen} payload

@@ -661,6 +661,116 @@ class Database extends EventEmitter {
   }
 
   /**
+   * Register a Virtual Table.
+   * Broadcasts the table definition to the Writer and all Reader workers.
+   *
+   * @warning The `factory` function is serialized to a string and executed inside the worker threads.
+   * Therefore, it **MUST be strictly self-contained** (pure). It cannot reference variables
+   * from the parent scope (closures) or external libraries not available in the worker context.
+   *
+   * @example
+   * await db.table('my_vtab', function() {
+   *   return {
+   *     rows: function* () { yield [1, 'a']; },
+   *     columns: ['id', 'name']
+   *   };
+   * });
+   *
+   * @param {string} name - The name of the virtual table.
+   * @param {Function} factory - A function that returns the VirtualTableOptions object.
+   * @returns {Promise<this>} The Database instance.
+   */
+  async table(name, factory) {
+    this._ensureOpen();
+    const factoryString = factory.toString();
+    const payload = { action: "table", name, factoryString };
+    const promises = [];
+    if (this.readerPool) {
+      promises.push(this.readerPool.broadcast(payload, true));
+    }
+    if (this.writer) {
+      promises.push(this.writer.execute(payload));
+    }
+    await Promise.all(promises);
+    return this;
+  }
+
+  /**
+   * Enable or disable unsafe mode.
+   * Unsafe mode disables certain internal SQLite mutexes and safety checks.
+   * This can improve performance but may lead to data corruption if the file is accessed
+   * by multiple processes without external coordination.
+   *
+   * Broadcasts the setting to all workers.
+   *
+   * @param {boolean} [unsafe=true] - If `true`, enables unsafe mode; if `false`, disables it.
+   * @returns {Promise<this>} The Database instance.
+   */
+  async unsafeMode(unsafe = true) {
+    this._ensureOpen();
+    const payload = { action: "unsafeMode", on: unsafe };
+    const promises = [];
+    if (this.readerPool) {
+      promises.push(this.readerPool.broadcast(payload, true));
+    }
+    if (this.writer) {
+      promises.push(this.writer.execute(payload));
+    }
+    await Promise.all(promises);
+    return this;
+  }
+
+  /**
+   * Create a backup of the database.
+   * This operation runs exclusively on the Writer thread to ensure consistency with the WAL.
+   *
+   * @description
+   * The backup is performed incrementally. If a `progress` callback is provided in the options,
+   * it will be invoked periodically as the backup proceeds.
+   *
+   * Note: The `progress` callback runs on the main thread, while the actual backup logic
+   * runs on the worker thread.
+   *
+   * @example
+   * const metadata = await db.backup('backup.db', {
+   *   progress({ totalPages, remainingPages }) {
+   *     const percent = ((totalPages - remainingPages) / totalPages) * 100;
+   *     console.log(`Backup progress: ${percent.toFixed(2)}%`);
+   *   }
+   * });
+   * console.log('Backup complete:', metadata);
+   *
+   * @param {string} destinationFile - The destination file path for the backup.
+   * @param {BackupOptions} [options] - Configuration options (e.g., `attached`, `progress`).
+   * @returns {Promise<BackupMetadata>} Resolves with metadata (totalPages, remainingPages) upon completion.
+   * @throws {Error} If the database is closed or the Writer worker is unavailable.
+   */
+  async backup(destinationFile, options = {}) {
+    this._ensureOpen();
+    if (!this.writer) throw new Error("Writer not available");
+
+    const { progress, ...workerOptions } = options;
+    if (progress && typeof progress !== "function")
+      throw new TypeError("options.progress must be a function");
+
+    // Use streaming protocol on the writer
+    const iterator = this.writer.streamExecute({
+      action: "backup",
+      filename: destinationFile,
+      options: workerOptions,
+    });
+
+    let finalResult = null;
+
+    for await (const info of iterator) {
+      if (progress) progress(info);
+      finalResult = info;
+    }
+
+    return finalResult;
+  }
+
+  /**
    * Execute a simple SQL query (no result retrieval).
    * Useful for DDL statements (CREATE TABLE, DROP TABLE, etc.).
    * @param {string} sql - The SQL statement.
