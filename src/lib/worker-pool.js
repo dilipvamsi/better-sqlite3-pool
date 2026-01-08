@@ -1,13 +1,19 @@
 /**
  * @file lib/worker-pool.js
- * @description A robust Worker Thread Pool implementation for Node.js.
- * Features:
- *  - Request/Response mapping using Unique IDs.
- *  - Auto-scaling (Min/Max workers).
- *  - "Available First" Load Balancing strategy.
- *  - Queue system for request buffering when saturated.
- *  - Direct Addressing (Sticky Sessions) for streaming support.
- *  - Random fallback selection when pool is full.
+ * @description A robust, thread-safe Worker Pool implementation for SQLite operations.
+ *
+ * Architecture:
+ * 1. SingleWorkerClient:
+ *    - Wraps a physical Node.js Worker thread.
+ *    - Manages Request/Response correlation via a Map.
+ *    - Implements a Streaming Protocol using Async Iterators.
+ *    - Enforces Mutex locking (for Writers) to prevent race conditions.
+ *
+ * 2. MultiWorkerClient:
+ *    - Manages a pool of SingleWorkerClients.
+ *    - Implements Load Balancing ("Available First" strategy).
+ *    - Implements Auto-Scaling (Min/Max workers).
+ *    - Implements Task Queuing when the pool is saturated.
  */
 
 const { Worker } = require("worker_threads");
@@ -15,31 +21,72 @@ const { EventEmitter } = require("events");
 const { SqliteError } = require("better-sqlite3-multiple-ciphers");
 const Mutex = require("./mutex");
 
-// =======================================================================
-// PRIVATE TOKENS (Internal access only)
-// =======================================================================
+// =============================================================================
+// INTERNAL SYMBOLS & CONSTANTS
+// =============================================================================
+
+/** Guard token to prevent direct instantiation of internal classes. */
 const kSingleWorker = Symbol("SingleWorker");
+/** Guard token to prevent direct instantiation of internal classes. */
 const kMultiWorker = Symbol("MultiWorker");
 
-// =======================================================================
-// 1. SINGLE WORKER WRAPPER
-// =======================================================================
+// =============================================================================
+// TYPE DEFINITIONS
+// =============================================================================
+
+/** @typedef {import('./worker').WorkerRequestPayload} WorkerRequestPayload */
 
 /**
- * @typedef {Object} WorkerMessage
- * @property {string} requestId - Correlates to the request.
- * @property {'success' | 'error'} status - Outcome status.
- * @property {any} [data] - Success payload.
- * @property {Object} [error] - Error details.
- * @property {string} [error.message]
- * @property {string} [error.code]
- * @property {string} [streamId]
+ * @typedef {Object} SerializedError
+ * @property {string} message - Error message.
+ * @property {string} code - Error code (e.g., 'SQLITE_CONSTRAINT').
  */
 
 /**
- * Represents a single Worker Thread instance.
- * Manages the specific "Request Map" for this thread to correlate
- * asynchronous responses back to their original promises.
+ * @typedef {Object} WorkerMessage
+ * @description The raw message structure received from the Worker Thread.
+ * @property {string} requestId - Unique ID correlating to a pending promise.
+ * @property {'success' | 'done' | 'error' | 'next'} status - Outcome status.
+ * @property {any} [data] - Payload for success, done, or next events.
+ * @property {SerializedError} [error] - Error details (if status is error).
+ */
+
+/**
+ * @typedef {Object} StreamContext
+ * @description Internal state for managing the Async Iterator bridge during streaming.
+ * @property {any[]} buffer - Queue of received data chunks not yet yielded.
+ * @property {Function|null} wake - Resolver function to unblock the iterator loop.
+ * @property {Error|null} error - Terminal error received from worker.
+ * @property {boolean} done - Terminal success flag.
+ */
+
+/**
+ * @typedef {Object} TaskRequest
+ * @description Represents a pending operation awaiting a response.
+ * @property {Function} [resolve] - Promise resolve function (Standard requests).
+ * @property {Function} [reject] - Promise reject function (Standard requests).
+ * @property {boolean} isStreaming - Flag indicating if this is a streaming request.
+ * @property {StreamContext} [streamCtx] - Context object (Streaming requests only).
+ */
+
+/**
+ * @typedef {Object} QueueItem
+ * @description Represents a task waiting in the MultiWorkerClient queue.
+ * @property {'std' | 'stream'} type - The type of execution.
+ * @property {any} data - The payload to send.
+ * @property {Function} resolve - Outer promise resolver.
+ * @property {Function} reject - Outer promise rejecter.
+ */
+
+// =============================================================================
+// 1. SINGLE WORKER CLIENT
+// =============================================================================
+
+/**
+ * @class SingleWorkerClient
+ * @extends EventEmitter
+ * @description Manages a single Node.js Worker thread instance.
+ * Handles locking, request correlation, and the streaming protocol.
  */
 class SingleWorkerClient extends EventEmitter {
   /**
@@ -66,8 +113,9 @@ class SingleWorkerClient extends EventEmitter {
     this.worker = new Worker(workerPath, nodeWorkerOpts);
 
     /**
-     * @type {Map<string, {resolve: Function, reject: Function}>}
-     * Stores pending promises mapped by Request ID.
+     * Maps RequestID -> TaskRequest.
+     * Stores pending promises/iterators waiting for worker responses.
+     * @type {Map<string, TaskRequest>}
      */
     this.requestMap = new Map();
 
@@ -79,8 +127,14 @@ class SingleWorkerClient extends EventEmitter {
     /** @type {number} Sequence number for requests. */
     this.sequence = 0;
 
-    /** @type {boolean} Availability status */
-    this.pinned = false;
+    /**
+     * Indicates the worker is busy/reserved.
+     * Set to TRUE when:
+     * 1. A Mutex lock is held (e.g., Writer transaction).
+     * 2. A Streaming operation is active (e.g., Backup/Iterator).
+     * @type {boolean}
+     */
+    this.locked = false;
 
     /** @type {Mutex | null} If useMutex is true, we enforce sequential execution for this worker */
     this.mutex = useMutex ? new Mutex() : null;
@@ -96,7 +150,7 @@ class SingleWorkerClient extends EventEmitter {
    *
    * @param {string} workerPath
    * @param {WorkerOptions} workerOptions - Options for the Worker instance.
-   * @param {Function} [initFn] - Async function(worker) => Promise<void>
+   * @param {(client: SingleWorkerClient) => Promise<void>} [initFn] - Async function(worker) => Promise<void>
    * @returns {Promise<SingleWorkerClient>}
    */
   static create(workerPath, workerOptions = {}, initFn = null) {
@@ -154,23 +208,53 @@ class SingleWorkerClient extends EventEmitter {
     });
   }
 
-  pin() {
-    this.pinned = true;
-  }
+  // ===========================================================================
+  // LOCK MANAGEMENT
+  // ===========================================================================
 
-  unpin() {
-    this.pinned = false;
+  /**
+   * Manually locks the worker.
+   * 1. Marks it as busy/reserved (for Load Balancer).
+   * 2. Acquires the Mutex (if enabled) to block other .execute() calls.
+   */
+  async lock() {
+    this.locked = true;
+    if (this.mutex) {
+      await this.mutex.acquire();
+    }
   }
 
   /**
-   * Checks if the worker is truly available for pruning or load balancing.
+   * Unlocks the worker.
+   * 1. Releases the Mutex.
+   * 2. Marks it as available.
+   */
+  unlock() {
+    if (this.mutex) {
+      this.mutex.release();
+    }
+    this.locked = false;
+    // Notify listeners (MultiWorkerClient) that this worker is available
+    this.emit("unlock");
+  }
+
+  /**
+   * Check availability.
+   * Workers are idle only if they have no active requests AND are not manually locked.
    */
   isIdle() {
-    return this.activeRequests === 0 && !this.pinned;
+    return this.activeRequests === 0 && !this.locked;
   }
+
+  // ===========================================================================
+  // STANDARD EXECUTION (Request -> Single Response)
+  // ===========================================================================
 
   /**
    * Sends a payload to the worker and waits for the response.
+   * STANDARD EXECUTION (Auto-Locking).
+   * Used for atomic, one-off operations (e.g. db.prepare().run()).
+   * Acquires the mutex, runs the task, releases the mutex
    * @param {any} data - The data payload to send.
    * @returns {Promise<any>} Resolves with the worker's result.
    */
@@ -180,21 +264,8 @@ class SingleWorkerClient extends EventEmitter {
       await this.mutex.acquire();
     }
 
-    // Mark as busy immediately
-    this.activeRequests++;
-
     try {
-      return await new Promise((resolve, reject) => {
-        // OPTIMIZATION: Use incrementing integer (Base36 string is shorter/cleaner)
-        // This is ~100x faster than generating a UUID
-        const requestId = `${this.id}_${this.sequence++}`;
-
-        // Store the promise controllers
-        this.requestMap.set(requestId, { resolve, reject });
-
-        // Send to the actual thread
-        this.worker.postMessage({ requestId, data });
-      });
+      return await this.noLockExecute(data);
     } finally {
       // Release Lock (if enabled)
       // This allows the next queued task to proceed.
@@ -205,24 +276,189 @@ class SingleWorkerClient extends EventEmitter {
   }
 
   /**
-   * Internal handler for incoming messages from the worker thread.
-   * @private
-   * @param {WorkerMessage} message - The message object { requestId, data, error, status }.
+   * Sends a payload to the worker and waits for the response.
+   * RAW EXECUTION (No Internal Locking).
+   * Used when the lock is already held externally (e.g. Transactions, Streams).
+   * WARNING: Calling this on a Writer without holding the lock can cause race conditions.
+   * @param {any} data - The data payload to send.
+   * @returns {Promise<any>} Resolves with the worker's result.
    */
-  _handleMessage({ requestId, data, error }) {
-    if (this.requestMap.has(requestId)) {
-      const { resolve, reject } = this.requestMap.get(requestId);
+  async noLockExecute(data) {
+    // Mark as busy immediately
+    this.activeRequests++;
 
-      // Cleanup map and state
-      this.requestMap.delete(requestId);
-      this.activeRequests--;
+    return new Promise((resolve, reject) => {
+      // OPTIMIZATION: Use incrementing integer (Base36 string is shorter/cleaner)
+      // This is ~100x faster than generating a UUID
+      const requestId = `${this.id}_${this.sequence++}`;
 
-      // Settle the promise
-      if (error) {
-        reject(new SqliteError(error.message, error.code));
-      } else {
-        resolve(data);
+      // Store the promise controllers
+      this.requestMap.set(requestId, { resolve, reject, isStreaming: false });
+
+      // Send to the actual thread
+      this.worker.postMessage({ requestId, data });
+    });
+  }
+
+  // ===========================================================================
+  // STREAMING EXECUTION (Request -> Multiple 'next' events -> Final Response)
+  // ===========================================================================
+
+  /**
+   * Executes a streaming request and yields results as they arrive.
+   *
+   * @description
+   * 1. Acquires the Mutex (if enabled).
+   * 2. Sets logical lock to TRUE (prevents other tasks from being scheduled).
+   * 3. Yields results from the worker via an Async Iterator.
+   * 4. Releases lock ONLY after iteration completes, errors, or is broken.
+   *
+   * @param {any} data - The payload.
+   * @returns {AsyncGenerator<any, void, unknown>}
+   */
+  async *streamExecute(data) {
+    await this.lock();
+    try {
+      // Delegate to internal generator
+      yield* this.noLockStreamExecute(data);
+    } finally {
+      // Ensure lock is released even if consumer calls 'break' in their loop
+      this.unlock();
+    }
+  }
+
+  /**
+   * Internal streaming generator logic.
+   * Implements a Pull-based system where the iterator pauses until data arrives.
+   * @private
+   * @param {any} data
+   */
+  async *noLockStreamExecute(data) {
+    this.activeRequests++;
+    const requestId = `${this.id}_${this.sequence++}`;
+
+    /** @type {StreamContext} */
+    const ctx = {
+      buffer: [],
+      wake: null, // Function to resolve the 'await' below
+      error: null,
+      done: false,
+    };
+
+    // Register streaming task
+    this.requestMap.set(requestId, { isStreaming: true, streamCtx: ctx });
+
+    this.worker.postMessage({ requestId, data });
+
+    try {
+      while (true) {
+        // 1. Flush Buffer: If we have data, yield immediately
+        if (ctx.buffer.length > 0) {
+          yield ctx.buffer.shift();
+          continue;
+        }
+
+        // 2. Check Terminal States
+        if (ctx.error) throw ctx.error;
+        if (ctx.done) break;
+
+        // 3. Suspend: Wait for _handleMessage to call ctx.wake()
+        await new Promise((resolve) => {
+          ctx.wake = resolve;
+        });
       }
+    } finally {
+      // Cleanup when loop finishes or crashes
+      if (this.requestMap.has(requestId)) {
+        this.requestMap.delete(requestId);
+        this.activeRequests--;
+      }
+    }
+  }
+
+  // ===========================================================================
+  // MESSAGE HANDLING & INTERNALS
+  // ===========================================================================
+
+  /**
+   * Internal handler for incoming messages from the worker thread.
+   * Dispatches results to the correct Promise or Stream Context.
+   * @private
+   * @param {WorkerMessage} message - The worker message.
+   */
+  _handleMessage({ requestId, status, data, error }) {
+    if (!this.requestMap.has(requestId)) return;
+    const task = this.requestMap.get(requestId);
+
+    // --- A. STREAMING RESPONSE LOGIC ---
+    if (task.isStreaming) {
+      const ctx = task.streamCtx;
+
+      if (status === "next") {
+        // Intermediate chunk: Buffer it and wake the iterator
+        ctx.buffer.push(data);
+        if (ctx.wake) {
+          ctx.wake();
+          ctx.wake = null;
+        }
+      } else if (status === "done") {
+        // Completion: Mark done, buffer optional final data, wake iterator
+        ctx.done = true;
+        if (data !== undefined) ctx.buffer.push(data);
+        if (ctx.wake) {
+          ctx.wake();
+          ctx.wake = null;
+        }
+      } else if (status === "error" || error) {
+        // Error: Store error and wake iterator to throw it
+        ctx.error = new SqliteError(
+          error ? error.message : "Unknown",
+          error ? error.code : "SQLITE_ERROR",
+        );
+        if (ctx.wake) {
+          ctx.wake();
+          ctx.wake = null;
+        }
+      } else if (status === "success") {
+        // Protocol Violation: Stream expects 'done', not 'success'
+        ctx.error = new SqliteError(
+          "Protocol Violation: Received 'success' for stream. Expected 'done'.",
+          "SQLITE_INTERNAL",
+        );
+        if (ctx.wake) {
+          ctx.wake();
+          ctx.wake = null;
+        }
+      }
+      return;
+    }
+
+    // --- B. STANDARD RESPONSE LOGIC ---
+    // Remove from map immediately as the request is finished
+    this.requestMap.delete(requestId);
+    this.activeRequests--;
+
+    if (status === "success") {
+      task.resolve(data);
+    } else if (status === "error" || error) {
+      task.reject(
+        new SqliteError(
+          error ? error.message : "Unknown",
+          error ? error.code : "SQLITE_ERROR",
+        ),
+      );
+    } else if (status === "next" || status === "done") {
+      // Protocol Violation: Standard request shouldn't get stream events
+      task.reject(
+        new SqliteError(
+          `Protocol Violation: Received '${status}' for standard request.`,
+          "SQLITE_INTERNAL",
+        ),
+      );
+    } else {
+      task.reject(
+        new SqliteError(`Unknown status: ${status}`, "SQLITE_INTERNAL"),
+      );
     }
   }
 
@@ -232,8 +468,7 @@ class SingleWorkerClient extends EventEmitter {
    * @param {Error} err
    */
   _handleError(err) {
-    console.log("err hand", err);
-    this._flushRequests(err);
+    this._flushRequests(new SqliteError(err.message, "SQLITE_ERROR"));
   }
 
   /**
@@ -242,7 +477,10 @@ class SingleWorkerClient extends EventEmitter {
    * @param {number} code - Exit code.
    */
   _handleExit(code) {
-    const err = new Error(`Worker stopped with exit code ${code}`);
+    const err = new SqliteError(
+      `Worker exited code ${code}`,
+      "SQLITE_INTERNAL",
+    );
     this._flushRequests(err);
     this.emit("exit", code);
   }
@@ -323,6 +561,9 @@ class MultiWorkerClient extends EventEmitter {
 
     /** @type {Array<{data: any, resolve: Function, reject: Function}>} Queue for pending tasks. */
     this.queue = [];
+
+    /** @type {Function[]} Queue for clients waiting for a locked worker to free up */
+    this.clientsWaitQueue = [];
 
     /** @type {number} Track workers currently being spawned to prevent over-scaling */
     this.spawningCount = 0;
@@ -479,6 +720,34 @@ class MultiWorkerClient extends EventEmitter {
   }
 
   /**
+   * Schedule a streaming execution.
+   * @param {any} data
+   * @param {string|null} [workerId] - Optional direct addressing.
+   *  @returns {Promise<AsyncGenerator<any, void, unknown>>} Resolves to the Iterator.
+   */
+  streamExecute(data, workerId = null, onNext) {
+    if (typeof onNext !== "function") {
+      return Promise.reject(
+        new SqliteError("streamExecute requires callback", "SQLITE_MISUSE"),
+      );
+    }
+
+    // 1. Direct Addressing
+    if (workerId) {
+      const worker = this.workers.find((x) => x.id === workerId);
+      return worker
+        ? Promise.reject(worker.streamExecute(data, onNext))
+        : Promise.reject(new SqliteError("Worker not found", "SQLITE_ERROR"));
+    }
+
+    // 2. Load Balancing (Queue)
+    return new Promise((resolve, reject) => {
+      this.queue.push({ type: "stream", data, resolve, reject, onNext });
+      this._processQueue();
+    });
+  }
+
+  /**
    * Sends the payload to ALL currently active workers.
    * Useful for cache clearing, configuration updates, or health checks.
    *
@@ -557,14 +826,22 @@ class MultiWorkerClient extends EventEmitter {
 
     // 2. If no free worker, but we have capacity, spawn a new one
     if (this.workers.length + this.pendingSpawns < this.maxWorkers) {
-      const newWorker = await this._spawnWorker();
-      return newWorker;
+      return await this._spawnWorker();
     }
 
-    // 3. Fallback: Select a RANDOM worker (Load distribution for saturated pools)
+    // 3. Try Busy but Unlocked (Load Balancing)
+    // We cannot return a locked worker.
+    // Select a RANDOM worker (Load distribution for saturated pools)
     // We avoid always picking index 0 to prevent "hot spotting" on the first worker.
-    const randomIndex = Math.floor(Math.random() * this.workers.length);
-    return this.workers[randomIndex];
+    const available = this.workers.filter((w) => !w.locked);
+    if (available.length > 0) {
+      return available[Math.floor(Math.random() * available.length)];
+    }
+
+    // 4. All Locked - Wait in Queue until 'unlock' event fires
+    return new Promise((resolve) => {
+      this.clientsWaitQueue.push(resolve);
+    });
   }
 
   /**
@@ -602,6 +879,9 @@ class MultiWorkerClient extends EventEmitter {
 
       worker.once("exit", () => this._handleWorkerExit(worker));
 
+      // Listen for unlocks to notify waiting getWorker callers
+      worker.on("unlock", () => this._notifyWaiters());
+
       this.workers.push(worker);
       return worker;
     } finally {
@@ -625,9 +905,32 @@ class MultiWorkerClient extends EventEmitter {
       // Add a small delay to prevent rapid-fire restart loops if error is persistent
       setTimeout(() => {
         this._spawnWorker()
-          .then(() => this._processQueue())
+          .then(() => {
+            // New worker is unlocked, notify waiters
+            this._notifyWaiters();
+            this._processQueue();
+          })
           .catch(console.error);
       }, 100);
+    }
+  }
+
+  /**
+   * Notifies waiters in getWorkerQueue when a worker becomes unlocked.
+   */
+  _notifyWaiters() {
+    if (this.clientsWaitQueue.length === 0) return;
+
+    // Find unlocked workers
+    const available = this.workers.filter((w) => !w.locked);
+
+    while (available.length > 0 && this.clientsWaitQueue.length > 0) {
+      // Pick a random available worker
+      const idx = Math.floor(Math.random() * available.length);
+      const worker = available.splice(idx, 1)[0];
+
+      const resolve = this.clientsWaitQueue.shift();
+      if (resolve) resolve(worker);
     }
   }
 

@@ -6,6 +6,7 @@
  * read-heavy workloads without blocking the event loop.
  */
 
+const { AsyncLocalStorage } = require("node:async_hooks");
 const { Worker } = require("node:worker_threads");
 const path = require("node:path");
 const EventEmitter = require("events");
@@ -19,66 +20,29 @@ const { SingleWorkerClient, MultiWorkerClient } = require("./worker-pool");
 // INTERNAL TYPE DEFINITIONS
 // =============================================================================
 
+/** @typedef {import('better-sqlite3-multiple-ciphers').Database.Options} NativeOptions */
+/** @typedef {import('better-sqlite3-multiple-ciphers').Database.RegistrationOptions} RegistrationOptions */
+/** @typedef {import('better-sqlite3-multiple-ciphers').Database.AggregateOptions} AggregateOptions */
+/** @typedef {import('better-sqlite3-multiple-ciphers').Database.SerializeOptions} SerializeOptions */
+
 /**
  * @typedef {Object} DatabaseOptions
- * @property {number} [minWorkers=1] - Minimum number of reader workers (alias: min).
- * @property {number} [maxWorkers=2] - Maximum number of reader workers (alias: max).
+ * @property {number} [minWorkers=1] - Minimum number of reader workers.
+ * @property {number} [maxWorkers=2] - Maximum number of reader workers.
  * @property {boolean} [readonly=false] - Open the database in read-only mode.
  * @property {boolean} [fileMustExist=false] - If true, throws if the database file does not exist.
  * @property {number} [timeout=5000] - The number of milliseconds to wait when locking the database.
  * @property {string} [nativeBinding] - Path to the native addon executable.
- * @property {Function} [verbose] - (Not supported in threaded mode) Function to call with execution information.
+ * @property {Function} [verbose] - (Not supported in threaded mode).
  */
 
 /**
- * @description Represents a pending operation waiting for a worker response.
- * @typedef {Object} PendingPromise
- * Stored in `writeQueue` and `reader.queue` maps.
- * @property {Function} resolve - callback to resolve the outer Promise.
- * @property {Function} reject - callback to reject the outer Promise.
- */
-
-/**
- * @description A full read task waiting in the global pool queue for an available worker.
- * @typedef {Object} QueuedTask
- * Stored in `this.readQueue` array.
- * @property {'exec' | 'run' | 'all' | 'get' | 'function' | 'stream_open' | 'stream_ack' | 'stream_close'} action - The specific operation to perform.
- * @property {string} sql - The SQL query string.
- * @property {Array<any>} [params] - The bind parameters.
- * @property {Object} [options] - execution options (raw, pluck, etc.).
- * @property {Function} resolve - callback to resolve the outer Promise.
- * @property {Function} reject - callback to reject the outer Promise.
- */
-
-/**
- * @description Represents a Reader Worker in the pool.
- * @typedef {Object} Reader
- * @property {number} id - Unique internal ID for tracking.
- * @property {Worker} worker - The native Node.js Worker thread instance.
- * @property {boolean} busy - True if the worker is currently executing a query.
- * @property {boolean} ready - True if the worker has finished initialization.
- * @property {Map<number, PendingPromise>} queue - Map of message IDs to pending promises.
- * @property {Promise<void>} readyPromise - Resolves when the worker sends the 'ready' signal.
- */
-
-/**
- * @description The structure of messages sent to workers.
- * @typedef {Object} WorkerPayload
- * @property {'run' | 'exec' | 'all' | 'get' | 'function' | 'close' | 'stream_open' | 'stream_ack' | 'stream_close'} action - The operation to perform.
- * @property {string} [sql] - SQL query.
- * @property {string} [fnName] - Function name (for UDFs).
- * @property {string} [fnString] - Function body string (for UDFs).
- * @property {Array<any>} [params] - Query parameters.
- * @property {Object} [options] - Execution options.
- */
-
-/**
- * @description The structure of messages received from workers.
- * @typedef {Object} WorkerResponse
- * @property {number} id - The correlation ID matching the request.
- * @property {'success' | 'error' | 'stream_data'} status - The outcome status.
- * @property {any} [data] - The result payload (on success).SQLITE_CANTOPEN
- * @property {any} [error] - The error payload (on error).
+ * @typedef {Object} WorkerConfig
+ * @property {string} filename
+ * @property {boolean} readonly
+ * @property {boolean} fileMustExist
+ * @property {number} timeout
+ * @property {string} [nativeBinding]
  */
 
 // =============================================================================
@@ -283,8 +247,18 @@ class Database extends EventEmitter {
       nativeBinding: this.options.nativeBinding,
     };
 
-    /** @type {boolean} - Internal flag for transaction state tracking. */
-    this.inTransaction = false;
+    /** @type {AsyncLocalStorage} - Stores the async context of the transaction. */
+    this.transactionContext = new AsyncLocalStorage();
+
+    this._spId = 0;
+  }
+
+  /**
+   * Getter to check if the CURRENT async execution context is inside a transaction.
+   * @returns {boolean}
+   */
+  get inTransaction() {
+    return this.transactionContext.getStore() === true;
   }
 
   /**
@@ -354,55 +328,6 @@ class Database extends EventEmitter {
   }
 
   /**
-   * Creates a new prepared statement.
-   * @param {string} sql - The SQL query string.
-   * @returns {Statement} A wrapped Statement instance.
-   */
-  prepare(sql) {
-    return new Statement(this, sql);
-  }
-
-  /**
-   * Internal Helper: Waits for the database infrastructure to be ready.
-   * This includes the Writer (DB file creation) and any Readers currently booting.
-   * @returns {Promise<void>}
-   * @private
-   */
-  async _waitForInitialization() {
-    try {
-      // 1. Wait for Writer (Critical: File existence)
-      // In readonly, this resolves immediately.
-      if (!this.writerReady) {
-        await this.writerReadyPromise;
-      }
-
-      // 2. Wait for any booting Readers (Consistency: Ensure they receive broadcasts)
-      const pendingReaders = this.readers
-        .filter((r) => !r.ready && r.readyPromise)
-        .map((r) => r.readyPromise);
-
-      if (pendingReaders.length > 0) {
-        await Promise.all(pendingReaders);
-      }
-      this.open = true;
-      this.emit("open");
-    } catch (err) {
-      this.open = false;
-      this.emit("error", err);
-      // Ensure cleanup if init failed
-      await this.close();
-    }
-  }
-
-  /**
-   * Returns a promise that resolves when the database pool is fully initialized.
-   * @returns {Promise<void>}
-   */
-  ready() {
-    return this._waitForInitialization();
-  }
-
-  /**
    * Helper to ensure DB is open before queuing work.
    * @throws {TypeError}
    */
@@ -413,23 +338,220 @@ class Database extends EventEmitter {
   }
 
   /**
+   * Creates a new prepared statement.
+   * @param {string} sql - The SQL query string.
+   * @returns {Statement} A wrapped Statement instance.
+   */
+  prepare(sql) {
+    this._ensureOpen();
+    return new Statement(this, sql);
+  }
+
+  /**
+   * Execute a function within a transaction.
+   * Supports nested transactions via SAVEPOINT.
+   *
+   * @param {Function} fn - Async function to execute.
+   * @returns {Function} - A wrapper function that executes the transaction.
+   */
+  transaction(fn) {
+    if (typeof fn !== "function") throw new TypeError("Expected a function");
+
+    // Helper to generate the specific wrapper
+    const createWrapper = (defaultBehavior) => {
+      return async (...args) => {
+        this._ensureOpen();
+
+        // Check if we are the Root Transaction (First one)
+        const isRoot = !this.inTransaction;
+
+        const runTransaction = async () => {
+          // 1. Acquire Lock (only if root)
+          // This blocks all other writes until this transaction finishes.
+          if (!this.writer) throw new Error("Writer not initialized");
+          if (isRoot) await this.writer.lock();
+
+          let savepointName = null;
+
+          try {
+            // 2. BEGIN / SAVEPOINT
+            if (isRoot) {
+              // Use the requested behavior for the root transaction
+              await this.writer.noLockExecute({
+                action: "exec",
+                sql: `BEGIN ${defaultBehavior}`,
+              });
+            } else {
+              // Nested transactions always use SAVEPOINT
+              savepointName = `sp_${this._spId++}`;
+              await this.writer.noLockExecute({
+                action: "exec",
+                sql: `SAVEPOINT ${savepointName}`,
+              });
+            }
+
+            // 3. Execute User Function
+            const result = await fn(...args);
+
+            // 4. COMMIT / RELEASE
+            if (isRoot) {
+              await this.writer.noLockExecute({
+                action: "exec",
+                sql: "COMMIT",
+              });
+            } else {
+              await this.writer.noLockExecute({
+                action: "exec",
+                sql: `RELEASE ${savepointName}`,
+              });
+            }
+            return result;
+          } catch (err) {
+            // 5. ROLLBACK
+            try {
+              if (isRoot) {
+                await this.writer.noLockExecute({
+                  action: "exec",
+                  sql: "ROLLBACK",
+                });
+              } else {
+                await this.writer.noLockExecute({
+                  action: "exec",
+                  sql: `ROLLBACK TO ${savepointName}`,
+                });
+              }
+            } catch (rollbackErr) {
+              // If rollback fails (e.g. DB crashed), we can't do much, but we should prioritize original error
+              console.error("Rollback failed:", rollbackErr);
+            }
+            throw err;
+          } finally {
+            // 6. Release Lock (only if root)
+            if (isRoot) this.writer.unlock();
+          }
+        };
+
+        // MAGIC HAPPENS HERE:
+        // We wrap the execution in transactionContext.run(true, ...)
+        // Any async operation inside 'runTransaction' (and 'fn') will see
+        // this.inTransaction as TRUE.
+        // Any parallel request outside this scope will see FALSE.
+        if (isRoot) {
+          return this.transactionContext.run(true, runTransaction);
+        } else {
+          // Already inside a context, just run
+          return runTransaction();
+        }
+      };
+    };
+
+    // The default wrapper uses IMMEDIATE (better for concurrency to avoid deadlocks in WAL)
+    const wrapper = createWrapper("IMMEDIATE");
+
+    // Attach specific behaviors per better-sqlite3 API
+    wrapper.default = createWrapper("DEFERRED"); // SQLite default is actually DEFERRED
+    wrapper.deferred = createWrapper("DEFERRED");
+    wrapper.immediate = createWrapper("IMMEDIATE");
+    wrapper.exclusive = createWrapper("EXCLUSIVE");
+
+    // @ts-ignore
+    return wrapper;
+  }
+
+  // =================================================================
+  // ENCRYPTION SUPPORT (Critical for multiple-ciphers)
+  // =================================================================
+
+  /**
+   * Set the encryption key for the database.
+   * Must be called immediately after creation.
+   * @param {string|Buffer} key
+   */
+  async key(key) {
+    this._ensureOpen();
+    // Action 'key' needs to be broadcast to ALL workers (Writer + Readers)
+    const payload = { action: "key", key };
+
+    const promises = [];
+    if (this.readerPool)
+      promises.push(this.readerPool.broadcast(payload, true)); // Sticky!
+    if (this.writer) promises.push(this.writer.execute(payload));
+
+    await Promise.all(promises);
+  }
+
+  /**
+   * Change the encryption key.
+   * @param {string|Buffer} key
+   */
+  async rekey(key) {
+    this._ensureOpen();
+    const payload = { action: "rekey", key };
+
+    // Rekey usually requires write access, but all connections need to update.
+    // However, usually rekey is done on the main connection.
+    // For a pool, this is complex. We will broadcast to ensure all connections update.
+    const promises = [];
+    if (this.readerPool)
+      promises.push(this.readerPool.broadcast(payload, true));
+    if (this.writer) promises.push(this.writer.execute(payload));
+
+    await Promise.all(promises);
+  }
+
+  /**
+   * Loads a compiled SQLite extension.
+   * @param {string} path
+   */
+  async loadExtension(path) {
+    this._ensureOpen();
+    const payload = { action: "load_extension", path };
+
+    // Must broadcast to ALL. If one worker has it and another doesn't, behavior is inconsistent.
+    const promises = [];
+    if (this.readerPool)
+      promises.push(this.readerPool.broadcast(payload, true));
+    if (this.writer) promises.push(this.writer.execute(payload));
+
+    await Promise.all(promises);
+  }
+
+  /** @typedef {import('better-sqlite3-multiple-ciphers').Database.RegistrationOptions} RegistrationOptions */
+
+  /**
    * Register a User Defined Function (UDF).
    * Broadcasts the function to the Writer and all Readers.
    * Waits for acknowledgement from all workers to ensure consistency.
    * @param {string} name - The name of the SQL function.
-   * @param {Function} fn - The JavaScript function to execute.
+   * @param {Function | RegistrationOptions} options - Function Registration Options.
+   * @param {Function} [fn] - The JavaScript function to execute.
    * @returns {Promise<this>} The Database instance.
    */
-  async function(name, fn) {
+  async function(name, options, fn) {
     this._ensureOpen();
+
+    // Argument shuffling to support optional 'options'
+    let callback = fn;
+    let opts = options;
+
+    if (typeof options === "function") {
+      callback = options;
+      opts = {};
+    }
+
     if (typeof name !== "string")
       throw new TypeError("Expected first argument to be a string");
-    if (typeof fn !== "function")
+    if (typeof callback !== "function")
       throw new TypeError("Expected second argument to be a function");
 
     const fnString = fn.toString();
     this._initFunctions.push({ name, fnString });
-    const payload = { action: "function", fnName: name, fnString };
+    const payload = {
+      action: "function",
+      fnName: name,
+      fnString,
+      fnOptions: opts,
+    };
 
     const promises = [];
 
@@ -445,6 +567,59 @@ class Database extends EventEmitter {
 
     await Promise.all(promises);
     return this;
+  }
+
+  /**
+   * Register a custom Aggregate Function.
+   * Broadcasts to all workers.
+   *
+   * @param {string} aggName - Name of the aggregate function (e.g. 'MEDIAN').
+   * @param {AggregateOptions} options - Configuration object (start, step, inverse, result).
+   * @returns {Promise<this>}
+   */
+  async aggregate(aggName, options) {
+    this._ensureOpen();
+    if (typeof aggName !== "string")
+      throw new TypeError("Expected first argument to be a string");
+    if (typeof options !== "object" || options === null)
+      throw new TypeError("Expected second argument to be an options object");
+    if (!options.step)
+      throw new TypeError("Expected options.step to be a function");
+
+    // Prepare payload
+    const payload = {
+      action: "aggregate",
+      aggName,
+      aggOptions: serializeAggregateOptions(options),
+    };
+
+    const promises = [];
+
+    // 1. Broadcast to Readers (Sticky)
+    if (this.readerPool) {
+      promises.push(this.readerPool.broadcast(payload, true));
+    }
+
+    // 2. Send to Writer
+    if (this.writer) {
+      // Use _requestWrite to ensure thread safety
+      promises.push(this._requestWrite("aggregate", payload));
+    }
+
+    await Promise.all(promises);
+    return this;
+  }
+
+  /**
+   * Serialize the database to a Buffer.
+   * @param {SerializeOptions} [options] - { attached: string }
+   * @returns {Promise<Buffer>}
+   */
+  async serialize(options) {
+    this._ensureOpen();
+    // Always use the writer to get the most up-to-date state
+    const result = await this._requestWrite("serialize", { options });
+    return result; // The worker returns the Buffer
   }
 
   /**
@@ -615,10 +790,10 @@ class Database extends EventEmitter {
     const isObj = typeof sqlOrPayload === "object" && sqlOrPayload !== null;
     const sql = isObj ? sqlOrPayload.sql : sqlOrPayload;
     const options = isObj ? sqlOrPayload.options : undefined;
-    const p = isObj ? sqlOrPayload.params : params;
+    const payloadParams = isObj ? sqlOrPayload.params : params;
 
     // Delegate to generic helper
-    return this.writer.execute({ action, sql, params: p, options });
+    return this.writer.execute({ action, sql, params: payloadParams, options });
   }
 
   /**
@@ -643,10 +818,15 @@ class Database extends EventEmitter {
     const isObj = typeof sqlOrPayload === "object" && sqlOrPayload !== null;
     const sql = isObj ? sqlOrPayload.sql : sqlOrPayload;
     const options = isObj ? sqlOrPayload.options : undefined;
-    const p = isObj ? sqlOrPayload.params : params;
+    const payloadParams = isObj ? sqlOrPayload.params : params;
 
     // Load Balanced Execution (No Mutex)
-    return this.readerPool.execute({ action, sql, params: p, options });
+    return this.readerPool.execute({
+      action,
+      sql,
+      params: payloadParams,
+      options,
+    });
   }
 }
 

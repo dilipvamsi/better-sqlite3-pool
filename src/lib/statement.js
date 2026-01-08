@@ -11,6 +11,10 @@ const { SingleWorkerClient } = require("./worker-pool");
 // TYPE DEFINITIONS
 // =============================================================================
 
+/** @typedef {import('./database').Database} Database */
+/** @typedef {import('./worker-pool').SingleWorkerClient} SingleWorkerClient */
+/** @typedef {import('better-sqlite3-multiple-ciphers').Database.RunResult} RunResult */
+
 /**
  * @typedef {Object} ExecutionOptions
  * @property {boolean} pluck - If true, returns only the first column.
@@ -23,17 +27,6 @@ const { SingleWorkerClient } = require("./worker-pool");
  * @property {string} sql - The SQL source.
  * @property {Array<any>} params - Bind parameters.
  * @property {ExecutionOptions} options - Formatting options.
- */
-
-/**
- * @typedef {Object} RunResult
- * @property {number} changes - The number of rows modified.
- * @property {number | bigint} lastInsertRowid - The rowid of the last inserted row.
- */
-
-/**
- * We import the Database class definition from the parent module.
- * @typedef {import('./database'.Database)} Database
  */
 
 // =============================================================================
@@ -150,7 +143,7 @@ class Statement {
    * Execute the query and return all matching rows.
    * Routes to Reader or Writer based on context.
    * @param {...any} params - Query parameters.
-   * @returns {Promise<any[]>} An array of rows.
+   * @returns {Promise<any[]>} An array of rows with column definitions.
    */
   async all(...params) {
     this.db._ensureOpen();
@@ -226,15 +219,15 @@ class Statement {
       workerClient = await this.db.readerPool.getWorker();
     }
 
-    // PIN THE WORKER
-    workerClient.pin();
+    // LOCK THE WORKER
+    await workerClient.lock();
 
     const streamId = Math.random().toString(36).slice(2);
     let columns = null;
 
     try {
       // 1. OPEN STREAM (Get first batch)
-      let result = await workerClient.execute({
+      let result = await workerClient.noLockExecute({
         action: "stream_open",
         streamId,
         sql: this.source,
@@ -260,7 +253,7 @@ class Statement {
       // 2. CONSUME REST
       while (!result.done) {
         // Request next batch
-        result = await workerClient.execute({
+        result = await workerClient.noLockExecute({
           action: "stream_next",
           streamId,
         });
@@ -280,7 +273,7 @@ class Statement {
       workerClient
         .execute({ action: "stream_close", streamId })
         .catch(() => {});
-      workerClient.unpin();
+      workerClient.unlock();
     }
   }
 

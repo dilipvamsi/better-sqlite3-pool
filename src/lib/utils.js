@@ -130,9 +130,22 @@ async function parentDirectoryExists(targetPath) {
   }
 }
 
+/**
+ * Helper to serialize the aggregate options object.
+ * Converts functions to strings.
+ */
+const serializeAggregateOptions = (opts) => {
+  const out = { ...opts };
+  if (typeof opts.step === "function") out.step = opts.step.toString();
+  if (typeof opts.inverse === "function") out.inverse = opts.inverse.toString();
+  if (typeof opts.result === "function") out.result = opts.result.toString();
+  return out;
+};
+
 module.exports = {
   castRow,
   createError,
   fileExists,
   parentDirectoryExists,
+  serializeAggregateOptions,
 };

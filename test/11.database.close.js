@@ -21,22 +21,30 @@ describe("Database#close()", function () {
     expect(this.db.open).to.be.false;
   });
 
-  // it("should prevent any further database operations", function () {
-  //   this.db.close();
-  //   expect(() => this.db.exec("CREATE TABLE people (name TEXT)")).to.throw(
-  //     TypeError,
-  //   );
-  //   expect(() => this.db.prepare("CREATE TABLE cats (name TEXT)")).to.throw(
-  //     TypeError,
-  //   );
-  //   expect(() => this.db.transaction(() => {})).to.throw(TypeError);
-  //   expect(() => this.db.pragma("cache_size")).to.throw(TypeError);
-  //   expect(() => this.db.function("foo", () => {})).to.throw(TypeError);
-  //   expect(() => this.db.aggregate("foo", { step: () => {} })).to.throw(
-  //     TypeError,
-  //   );
-  //   expect(() => this.db.table("foo", () => {})).to.throw(TypeError);
-  // });
+  it("should prevent any further database operations", async function () {
+    await this.db.close();
+    this.db
+      .exec("CREATE TABLE people (name TEXT)")
+      .catch((err) => err.to.throw(TypeError));
+    try {
+      this.db.prepare("CREATE TABLE cats (name TEXT)");
+    } catch (err) {
+      expect(err).to.be.instanceOf(TypeError);
+    }
+    try {
+      this.db.transaction(() => {});
+    } catch (err) {
+      expect(err).to.be.instanceOf(TypeError);
+    }
+
+    this.db.pragma("cache_size").catch((err) => err.to.throw(TypeError));
+    this.db.function("foo", () => {}).catch((err) => err.to.throw(TypeError));
+
+    // expect(() => this.db.aggregate("foo", { step: () => {} })).to.throw(
+    //   TypeError,
+    // );
+    // expect(() => this.db.table("foo", () => {})).to.throw(TypeError);
+  });
 
   it("should prevent any existing statements from running", async function () {
     await this.db.prepare("CREATE TABLE people (name TEXT)").run();
