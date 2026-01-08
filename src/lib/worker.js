@@ -40,6 +40,7 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
  * @typedef {Object} SerializedError
  * @property {string} message
  * @property {string} code
+ * @property {string} name
  */
 
 /**
@@ -391,7 +392,7 @@ try {
 }
 
 // Enable BigInt support for large integers
-db.defaultSafeIntegers(true);
+// db.defaultSafeIntegers(true);
 
 if (parentPort) parentPort.postMessage({ status: "ready" });
 
@@ -926,5 +927,5 @@ function formatError(err) {
     err.code !== undefined && typeof err.code === "string"
       ? err.code
       : "SQLITE_ERROR";
-  return { message: err.message, code };
+  return { message: err.message, code, name: err.name };
 }

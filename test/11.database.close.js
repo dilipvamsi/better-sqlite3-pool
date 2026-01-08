@@ -10,6 +10,16 @@ describe("Database#close()", function () {
     await this.db.close();
   });
 
+  const expectRejection = async (promise, ExpectedError) => {
+    try {
+      await promise;
+      throw new Error("Expected promise to reject, but it resolved");
+    } catch (err) {
+      // console.log(err);
+      expect(err).to.be.instanceof(ExpectedError);
+    }
+  };
+
   it("should cause db.open to return false", async function () {
     expect(this.db.open).to.be.true;
     await this.db.close();
@@ -23,27 +33,27 @@ describe("Database#close()", function () {
 
   it("should prevent any further database operations", async function () {
     await this.db.close();
-    this.db
-      .exec("CREATE TABLE people (name TEXT)")
-      .catch((err) => err.to.throw(TypeError));
-    try {
-      this.db.prepare("CREATE TABLE cats (name TEXT)");
-    } catch (err) {
-      expect(err).to.be.instanceOf(TypeError);
-    }
-    try {
-      this.db.transaction(() => {});
-    } catch (err) {
-      expect(err).to.be.instanceOf(TypeError);
-    }
-
-    this.db.pragma("cache_size").catch((err) => err.to.throw(TypeError));
-    this.db.function("foo", () => {}).catch((err) => err.to.throw(TypeError));
-
-    // expect(() => this.db.aggregate("foo", { step: () => {} })).to.throw(
-    //   TypeError,
-    // );
-    // expect(() => this.db.table("foo", () => {})).to.throw(TypeError);
+    await expectRejection(
+      this.db.exec("CREATE TABLE people (name TEXT)"),
+      TypeError,
+    );
+    expect(() => this.db.prepare("CREATE TABLE cats (name TEXT)")).to.throw(
+      TypeError,
+    );
+    expect(() => this.db.transaction(() => {})).to.throw(TypeError);
+    await expectRejection(this.db.pragma("cache_size"), TypeError);
+    await expectRejection(
+      this.db.function("foo", () => {}),
+      TypeError,
+    );
+    await expectRejection(
+      this.db.table("foo", () => {}),
+      TypeError,
+    );
+    await expectRejection(
+      this.db.aggregate("foo", { step: () => {} }),
+      TypeError,
+    );
   });
 
   it("should prevent any existing statements from running", async function () {
@@ -62,14 +72,10 @@ describe("Database#close()", function () {
 
     expect(() => stmt1.bind()).to.throw(TypeError);
     expect(() => stmt2.bind()).to.throw(TypeError);
-    stmt1.get().then((err) => err.to.throw(TypeError));
-    stmt1.all().then((err) => err.to.throw(TypeError));
-    try {
-      await stmt1.iterate();
-    } catch (err) {
-      err.to.throw(TypeError);
-    }
-    stmt2.run().then((err) => err.to.throw(TypeError));
+    await expectRejection(stmt1.get(), TypeError);
+    await expectRejection(stmt1.all(), TypeError);
+    expect(() => stmt1.iterate()).to.throw(TypeError);
+    await expectRejection(stmt2.run(), TypeError);
   });
 
   it("should delete the database's associated temporary files", async function () {

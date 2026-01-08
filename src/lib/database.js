@@ -349,6 +349,19 @@ class Database extends EventEmitter {
    */
   prepare(sql) {
     this._ensureOpen();
+
+    if (typeof sql !== "string") {
+      throw new TypeError("SQL statement must be a string");
+    }
+
+    const trimmedSql = sql.trim();
+
+    if (trimmedSql.length === 0) {
+      throw new RangeError("SQL statement cannot be empty");
+    } else if (trimmedSql.startsWith(";")) {
+      throw new RangeError("SQL statement cannot start with a semicolon");
+    }
+
     return new Statement(this, sql);
   }
 
@@ -361,6 +374,7 @@ class Database extends EventEmitter {
    */
   transaction(fn) {
     if (typeof fn !== "function") throw new TypeError("Expected a function");
+    this._ensureOpen();
 
     // Helper to generate the specific wrapper
     const createWrapper = (defaultBehavior) => {
@@ -657,6 +671,21 @@ class Database extends EventEmitter {
   async pragma(sql, options = {}) {
     this._ensureOpen();
 
+    if (!sql) {
+      throw new TypeError("SQL statement is required");
+    } else if (typeof sql !== "string") {
+      throw new TypeError("SQL statement must be a string");
+    }
+
+    if (options !== undefined && typeof options !== "object") {
+      throw new TypeError("Options must be an object");
+    } else if (
+      options.simple !== undefined &&
+      typeof options.simple !== "boolean"
+    ) {
+      throw new TypeError("Options.simple must be a boolean");
+    }
+
     // Use specific 'pragma' action so worker uses db.pragma() instead of db.exec()
     const payload = { action: "pragma", sql, options };
 
@@ -801,7 +830,23 @@ class Database extends EventEmitter {
    */
   async exec(sql) {
     this._ensureOpen();
-    return this.prepare(sql).run();
+    const payload = { action: "exec", sql };
+
+    // READONLY MODE:
+    // Route to the Reader Pool.
+    // The Worker will let SQLite throw SQLITE_READONLY if it's actually a write.
+    if (this.readonly) {
+      if (!this.readerPool) {
+        throw new TypeError("No available workers for execution");
+      }
+      await this.readerPool.execute(payload);
+      return this;
+    }
+
+    // WRITE MODE:
+    // Route to Writer via _requestWrite to respect transaction locks.
+    await this._requestWrite("exec", payload);
+    return this;
   }
 
   /**
@@ -916,17 +961,32 @@ class Database extends EventEmitter {
    */
   async _requestWrite(action, sqlOrPayload, params) {
     this._ensureOpen();
-    if (this.readonly || !this.writer) {
-      throw new Error("Cannot execute write operation in readonly mode");
+
+    // Check for Read-Only mode violation
+    if (this.readonly) {
+      throw new SqliteError(
+        "attempt to write a readonly database",
+        "SQLITE_READONLY",
+      );
+    }
+
+    // Safety check for writer availability (should be covered by _ensureOpen, but good to have)
+    if (!this.writer) {
+      throw new TypeError("The database connection is not open");
     }
 
     const isObj = typeof sqlOrPayload === "object" && sqlOrPayload !== null;
-    const sql = isObj ? sqlOrPayload.sql : sqlOrPayload;
-    const options = isObj ? sqlOrPayload.options : undefined;
-    const payloadParams = isObj ? sqlOrPayload.params : params;
+    const payload = isObj
+      ? { action, ...sqlOrPayload }
+      : { action, sql: sqlOrPayload, params, options: undefined };
 
-    // Delegate to generic helper
-    return this.writer.execute({ action, sql, params: payloadParams, options });
+    // SCENARIO 1: Inside a transaction (we own the lock)
+    if (this.inTransaction) {
+      return this.writer.noLockExecute(payload);
+    }
+
+    // SCENARIO 2: Stand-alone write (needs atomic lock)
+    return this.writer.execute(payload);
   }
 
   /**

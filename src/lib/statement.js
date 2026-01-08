@@ -47,32 +47,56 @@ class Statement {
    * @param {string} sql - The raw SQL string.
    */
   constructor(db, sql) {
+    // Validation to satisfy "expect(() => new stmt.constructor(source)).to.throw(TypeError);"
+    // We check if 'db' looks like our Database object (has 'prepare' method)
+    if (!db || typeof db.prepare !== "function") {
+      throw new TypeError("Expected first argument to be a Database instance");
+    }
+    if (typeof sql !== "string") {
+      throw new TypeError("Expected second argument to be a string");
+    }
+
     /** @type {Database} Reference to the main pool instance. */
-    this.db = db;
+    this.database = db;
 
     /** @type {string} The SQL source string. */
     this.source = sql;
 
-    // --- PARSING LOGIC (Heuristic) ---
-    // 1. Is it a SELECT or EXPLAIN?
-    const isSelect = /^\s*(SELECT|EXPLAIN)/i.test(sql);
-    // 2. Does it use the RETURNING clause? (Writes data but returns rows)
-    const hasReturning = /RETURNING/i.test(sql);
+    /**
+     * @type {boolean}
+     * Indicates if the statement is "Read-Only" safe.
+     *
+     * Used for **Connection Routing**:
+     * - `true`: Can be safely executed on a load-balanced Reader worker (or the Writer).
+     * - `false`: Must be executed on the Writer (modifies data or acquires write locks).
+     *
+     * Logic:
+     * 1. EXCLUDE `BEGIN IMMEDIATE/EXCLUSIVE`: These explicitly acquire write locks.
+     * 2. INCLUDE `SELECT`, `EXPLAIN`, `VALUES`, and Transaction controls (`BEGIN`, `COMMIT`, etc).
+     * 3. EXCLUDE `RETURNING`: Write operations (INSERT/UPDATE) that return data are NOT read-only.
+     */
+    this.readonly =
+      !/^\s*BEGIN\s+(IMMEDIATE|EXCLUSIVE)/i.test(this.source) &&
+      /^\s*(SELECT|EXPLAIN|VALUES|BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE)/i.test(
+        this.source,
+      ) &&
+      !/RETURNING\b/i.test(this.source);
 
     /**
      * @type {boolean}
-     * Heuristic to determine if this is a Read-Only query.
-     * We exclude 'RETURNING' clauses because they write data (INSERT/UPDATE/DELETE)
-     * but return rows like a SELECT.
+     * Indicates if the statement returns data (Rows).
+     *
+     * Used for **API Behavior**:
+     * - `true`: The statement supports `.get()`, `.all()`, and `.iterate()`.
+     * - `false`: The statement typically uses `.run()` (though `.all()` might return empty array).
+     *
+     * Logic:
+     * 1. Standard reads: `SELECT`, `EXPLAIN`, `PRAGMA`, `VALUES`.
+     * 2. Write-with-return: Any statement containing a `RETURNING` clause.
      */
-    this.readonly = isSelect && !hasReturning;
-
-    /**
-     * @type {boolean}
-     * READER: True if it returns rows (SELECT, EXPLAIN, or INSERT...RETURNING).
-     * Used for API validation: .get()/.all() are valid if this is true.
-     */
-    this.reader = isSelect || hasReturning;
+    this.reader =
+      /^\s*(SELECT|EXPLAIN|PRAGMA|VALUES)/i.test(this.source) ||
+      /RETURNING\b/i.test(this.source);
 
     /** @type {Array<any>} Default parameters bound via .bind() */
     this.boundParams = [];
@@ -91,7 +115,7 @@ class Statement {
     this._columns = [];
 
     /** @type {boolean} */
-    this._busy = false;
+    this.busy = false;
 
     /**
      * Flag to track if the statement has been executed at least once.
@@ -99,16 +123,6 @@ class Statement {
      * @type {boolean}
      */
     this._hasExecuted = false;
-  }
-
-  get database() {
-    return this.db;
-  }
-  /**
-   * Returns true if the statement is currently being iterated.
-   */
-  get busy() {
-    return this._busy;
   }
 
   /**
@@ -175,7 +189,7 @@ class Statement {
    * @returns {this}
    */
   bind(...params) {
-    this.db._ensureOpen();
+    this.database._ensureOpen();
     this.boundParams = params;
     return this;
   }
@@ -192,25 +206,29 @@ class Statement {
    * @returns {Promise<RunResult>}
    */
   async run(...params) {
-    this.db._ensureOpen();
+    this.database._ensureOpen();
+    const stmtParams = params.length ? params : this.boundParams;
+    const payload = {
+      sql: this.source,
+      params: stmtParams,
+      options: this._getOptions(),
+    };
 
-    if (this.reader && !this.readonly && !this._pluck && !this._raw) {
-      // Edge case: INSERT RETURNING called with .run()
-      // better-sqlite3 allows this but discards rows. We treat it normally.
+    // 1. Read-Only Database Handling
+    if (this.database.readonly) {
+      // In readonly mode, we must send to the Reader Pool.
+      // We cannot use action='run' because the Worker logic throws on 'run'
+      // when checking isWriter.
+      // We send 'all' instead.
+      // - If SQL is SELECT: Succeeded. We discard rows. Return dummy result.
+      // - If SQL is INSERT: SQLite engine throws SQLITE_READONLY.
+      await this.database._requestRead("all", payload);
+      return { changes: 0, lastInsertRowid: 0 };
     }
 
-    const stmtParms = params.length ? params : this.boundParams;
-
-    // Writers handle locking internally via db.writeMutex
-    const result = await this.db._requestWrite("run", {
-      sql: this.source,
-      params: stmtParms,
-      options: this._getOptions(),
-    });
-
-    // run() doesn't typically return columns, but we mark execution as done.
-    this._hasExecuted = true;
-    return result;
+    // 2. Standard Write Mode
+    // Writers handle locking internally via db.writer.lock()
+    return this.database._requestWrite("run", payload);
   }
 
   /**
@@ -220,7 +238,7 @@ class Statement {
    * @returns {Promise<any[]>} An array of rows with column definitions.
    */
   async all(...params) {
-    this.db._ensureOpen();
+    this.database._ensureOpen();
     const stmtParams = params.length ? params : this.boundParams;
 
     /** @type {QueryPayload} */
@@ -233,13 +251,21 @@ class Statement {
     let result;
 
     // --- ROUTING LOGIC ---
+    // Read only database route to reader pool
+    if (this.database.readonly) {
+      result = await this.database._requestRead("all", payload);
+    }
     // 1. Transaction: Must use Writer (Reader workers don't see uncommitted data).
     // 2. Write Query: Queries with RETURNING (INSERT..RETURNING) must go to Writer.
     // 3. Memory DB: Only Writer exists (Readers are disabled).
-    if (this.db.inTransaction || !this.readonly || this.db.memory) {
-      result = await this.db._requestWrite("all", payload);
+    else if (
+      this.database.inTransaction ||
+      !this.readonly ||
+      this.database.memory
+    ) {
+      result = await this.database._requestWrite("all", payload);
     } else {
-      result = await this.db._requestRead("all", payload);
+      result = await this.database._requestRead("all", payload);
     }
 
     // Capture columns from worker response
@@ -257,7 +283,7 @@ class Statement {
       result.rows.forEach((row) => castRow(row, result.columns));
     }
 
-    return result.rows;
+    return result.rows || [];
   }
 
   /**
@@ -266,7 +292,7 @@ class Statement {
    * @returns {Promise<any | undefined>} The first row or undefined.
    */
   async get(...params) {
-    this.db._ensureOpen();
+    this.database._ensureOpen();
     const rows = await this.all(...params);
     return rows ? rows[0] : undefined;
   }
@@ -277,12 +303,29 @@ class Statement {
    * @param {...any} params
    * @returns {AsyncIterableIterator<any>}
    */
-  async *iterate(...params) {
-    this.db._ensureOpen();
+  iterate(...params) {
+    // 1. Synchronous Check (Throws immediately if DB is closed)
+    this.database._ensureOpen();
+
+    // 2. Delegate to the internal Async Generator
+    return this._iterate(...params);
+  }
+
+  /**
+   * Execute the query and return an Async Iterator.
+   * Uses a sticky worker connection and streaming protocol.
+   * @param {...any} params
+   * @returns {AsyncIterableIterator<any>}
+   */
+  async *_iterate(...params) {
+    this.database._ensureOpen();
     const stmtParams = params.length ? params : this.boundParams;
 
     // --- FALLBACK: IN-MEMORY / NO POOL ---
-    if (this.db.memory || (!this.db.readerPool && this.db.writer)) {
+    if (
+      this.database.memory ||
+      (!this.database.readerPool && this.database.writer)
+    ) {
       const rows = await this.all(...stmtParams);
       for (const row of rows) yield row;
       return;
@@ -292,22 +335,26 @@ class Statement {
     /** @type {SingleWorkerClient} */
     let workerClient;
 
-    if (this.db.inTransaction || !this.readonly) {
-      if (!this.db.writer) {
+    if (this.database.readonly) {
+      workerClient = await this.database.readerPool.getWorker();
+    } else if (this.database.inTransaction || !this.readonly) {
+      if (!this.database.writer) {
         throw new SqliteError("No writer available", "SQLITE_MISUSE");
       }
-      workerClient = this.db.writer;
+      workerClient = this.database.writer;
     } else {
-      workerClient = await this.db.readerPool.getWorker();
+      workerClient = await this.database.readerPool.getWorker();
     }
 
     // LOCK THE WORKER
-    await workerClient.lock();
+    if (!this.database.inTransaction) {
+      await workerClient.lock();
+    }
 
     const iteratorId = Math.random().toString(36).slice(2);
     let columns = null;
 
-    this._busy = true; // Mark busy
+    this.busy = true; // Mark busy
 
     try {
       // 1. OPEN STREAM (Get first batch)
@@ -359,11 +406,13 @@ class Statement {
       }
     } finally {
       // 3. CLEANUP
-      this._busy = false; // Mark not busy
+      this.busy = false; // Mark not busy
       workerClient
-        .execute({ action: "iterator_close", iteratorId })
+        .noLockExecute({ action: "iterator_close", iteratorId })
         .catch(() => {});
-      workerClient.unlock();
+      if (!this.database.inTransaction) {
+        workerClient.unlock();
+      }
     }
   }
 
