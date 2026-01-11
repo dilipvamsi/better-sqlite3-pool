@@ -12,6 +12,7 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
 // TYPE DEFINITIONS
 // =============================================================================
 
+/** @typedef {import('./connection')} Connection */
 /** @typedef {import('./database').Database} Database */
 /** @typedef {import('./worker-pool').SingleWorkerClient} SingleWorkerClient */
 /** @typedef {import('better-sqlite3-multiple-ciphers').Database.RunResult} RunResult */
@@ -32,6 +33,38 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
  */
 
 // =============================================================================
+// INTERNAL HELPERS
+// =============================================================================
+
+/**
+ * Validates parameters to ensure they are compatible with better-sqlite3 constraints.
+ * Specifically checks for custom class instances which are strictly forbidden.
+ *
+ * @param {Array<any>} params
+ * @throws {TypeError} If a parameter is an invalid object type.
+ */
+function validateParams(params) {
+  for (const param of params) {
+    if (param !== null && typeof param === "object") {
+      // 1. Buffers are allowed
+      if (Buffer.isBuffer(param)) continue;
+
+      // 2. Arrays are allowed (as positional arguments list)
+      if (Array.isArray(param)) continue;
+
+      // 3. Plain Objects are allowed (as named parameters)
+      // We check prototype chain to detect custom classes or wrapped primitives (new Number(1))
+      const proto = Object.getPrototypeOf(param);
+      if (proto !== Object.prototype && proto !== null) {
+        throw new TypeError(
+          "better-sqlite3-pool: Parameters must be primitives, Buffers, Arrays, or plain Objects.",
+        );
+      }
+    }
+  }
+}
+
+// =============================================================================
 // STATEMENT CLASS
 // =============================================================================
 
@@ -43,21 +76,27 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
 class Statement {
   /**
    * Create a new Statement proxy.
-   * @param {Database} db - The parent Database instance.
+   * @param {Database | Connection} dbOrConn - The parent Database instance or Connection instance.
    * @param {string} sql - The raw SQL string.
    */
-  constructor(db, sql) {
+  constructor(dbOrConn, sql) {
     // Validation to satisfy "expect(() => new stmt.constructor(source)).to.throw(TypeError);"
     // We check if 'db' looks like our Database object (has 'prepare' method)
-    if (!db || typeof db.prepare !== "function") {
-      throw new TypeError("Expected first argument to be a Database instance");
+    const type = dbOrConn ? dbOrConn.constructor.name : "Unknown";
+    if (!dbOrConn || (type !== "Database" && type !== "Connection")) {
+      throw new TypeError(
+        "Expected first argument to be a Database or Connection instance",
+      );
     }
     if (typeof sql !== "string") {
       throw new TypeError("Expected second argument to be a string");
     }
 
+    /** @type {Database | Connection} The execution context (DB Pool or Exclusive Session). */
+    this.ctx = dbOrConn;
+
     /** @type {Database} Reference to the main pool instance. */
-    this.database = db;
+    this.db = type === "Connection" ? dbOrConn.db : dbOrConn;
 
     /** @type {string} The SQL source string. */
     this.source = sql;
@@ -126,6 +165,14 @@ class Statement {
   }
 
   /**
+   * The parent database object.
+   * Required for better-sqlite3 API compatibility tests.
+   */
+  get database() {
+    return this.db;
+  }
+
+  /**
    * Returns the column metadata.
    * @throws {SqliteError} If accessed before the statement has been executed.
    */
@@ -189,7 +236,8 @@ class Statement {
    * @returns {this}
    */
   bind(...params) {
-    this.database._ensureOpen();
+    this.db._ensureOpen();
+    validateParams(params);
     this.boundParams = params;
     return this;
   }
@@ -206,7 +254,11 @@ class Statement {
    * @returns {Promise<RunResult>}
    */
   async run(...params) {
-    this.database._ensureOpen();
+    this.db._ensureOpen();
+
+    // Validate inputs BEFORE serialization strips the prototype info
+    if (params.length > 0) validateParams(params);
+
     const stmtParams = params.length ? params : this.boundParams;
     const payload = {
       sql: this.source,
@@ -215,20 +267,15 @@ class Statement {
     };
 
     // 1. Read-Only Database Handling
-    if (this.database.readonly) {
+    if (this.db.readonly) {
       // In readonly mode, we must send to the Reader Pool.
-      // We cannot use action='run' because the Worker logic throws on 'run'
-      // when checking isWriter.
-      // We send 'all' instead.
-      // - If SQL is SELECT: Succeeded. We discard rows. Return dummy result.
-      // - If SQL is INSERT: SQLite engine throws SQLITE_READONLY.
-      await this.database._requestRead("all", payload);
+      await this.db._requestRead("run", payload);
       return { changes: 0, lastInsertRowid: 0 };
     }
 
     // 2. Standard Write Mode
     // Writers handle locking internally via db.writer.lock()
-    return this.database._requestWrite("run", payload);
+    return this.ctx._requestWrite("run", payload);
   }
 
   /**
@@ -238,7 +285,11 @@ class Statement {
    * @returns {Promise<any[]>} An array of rows with column definitions.
    */
   async all(...params) {
-    this.database._ensureOpen();
+    this.db._ensureOpen();
+
+    // Validate inputs BEFORE serialization strips the prototype info
+    if (params.length > 0) validateParams(params);
+
     const stmtParams = params.length ? params : this.boundParams;
 
     /** @type {QueryPayload} */
@@ -251,21 +302,24 @@ class Statement {
     let result;
 
     // --- ROUTING LOGIC ---
-    // Read only database route to reader pool
-    if (this.database.readonly) {
-      result = await this.database._requestRead("all", payload);
-    }
-    // 1. Transaction: Must use Writer (Reader workers don't see uncommitted data).
-    // 2. Write Query: Queries with RETURNING (INSERT..RETURNING) must go to Writer.
-    // 3. Memory DB: Only Writer exists (Readers are disabled).
-    else if (
-      this.database.inTransaction ||
-      !this.readonly ||
-      this.database.memory
-    ) {
-      result = await this.database._requestWrite("all", payload);
+    // If context is a Connection, it handles routing (always to Writer).
+    // If context is Database, it handles routing (Reader vs Writer).
+    if (this.ctx.constructor.name === "Connection") {
+      // Inside transaction/session: Always write
+      result = await this.ctx._requestWrite("all", payload);
     } else {
-      result = await this.database._requestRead("all", payload);
+      // Read only database route to reader pool
+      if (this.db.readonly) {
+        result = await this.db._requestRead("all", payload);
+      }
+      // 1. Transaction: Must use Writer (Reader workers don't see uncommitted data).
+      // 2. Write Query: Queries with RETURNING (INSERT..RETURNING) must go to Writer.
+      // 3. Memory DB: Only Writer exists (Readers are disabled).
+      else if (this.db.inTransaction || !this.readonly || this.db.memory) {
+        result = await this.db._requestWrite("all", payload);
+      } else {
+        result = await this.db._requestRead("all", payload);
+      }
     }
 
     // Capture columns from worker response
@@ -292,7 +346,7 @@ class Statement {
    * @returns {Promise<any | undefined>} The first row or undefined.
    */
   async get(...params) {
-    this.database._ensureOpen();
+    this.db._ensureOpen();
     const rows = await this.all(...params);
     return rows ? rows[0] : undefined;
   }
@@ -305,7 +359,10 @@ class Statement {
    */
   iterate(...params) {
     // 1. Synchronous Check (Throws immediately if DB is closed)
-    this.database._ensureOpen();
+    this.db._ensureOpen();
+
+    // Validate inputs BEFORE serialization strips the prototype info
+    if (params.length > 0) validateParams(params);
 
     // 2. Delegate to the internal Async Generator
     return this._iterate(...params);
@@ -318,14 +375,11 @@ class Statement {
    * @returns {AsyncIterableIterator<any>}
    */
   async *_iterate(...params) {
-    this.database._ensureOpen();
+    this.db._ensureOpen();
     const stmtParams = params.length ? params : this.boundParams;
 
     // --- FALLBACK: IN-MEMORY / NO POOL ---
-    if (
-      this.database.memory ||
-      (!this.database.readerPool && this.database.writer)
-    ) {
+    if (this.db.memory || (!this.db.readerPool && this.db.writer)) {
       const rows = await this.all(...stmtParams);
       for (const row of rows) yield row;
       return;
@@ -334,21 +388,36 @@ class Statement {
     // --- WORKER ACQUISITION ---
     /** @type {SingleWorkerClient} */
     let workerClient;
+    /** @type {boolean} manually lock if it's not a transaction */
+    let manualLock = false;
 
-    if (this.database.readonly) {
-      workerClient = await this.database.readerPool.getWorker();
-    } else if (this.database.inTransaction || !this.readonly) {
-      if (!this.database.writer) {
+    // 1. Determine Worker
+    if (this.ctx instanceof Connection) {
+      // We are bound to an exclusive connection. Use its writer.
+      workerClient = this.ctx.writer;
+      // Do NOT call lock(), it is already locked by the Connection.
+    } else if (this.db.inTransaction || (!this.db.readonly && !this.readonly)) {
+      // DB-level transaction wrapper active OR Write query
+      if (!this.db.writer) {
         throw new SqliteError("No writer available", "SQLITE_MISUSE");
       }
-      workerClient = this.database.writer;
+      workerClient = this.db.writer;
+      // We shouldn't need to lock if inTransaction (wrapper handles it),
+      // but if it's just a write query iterate(), we might need to lock.
+      // Actually, iterate() on a write query is rare/weird, usually implies RETURNING.
+      if (!this.db.inTransaction) {
+        await workerClient.lock();
+        manualLock = true;
+      }
     } else {
-      workerClient = await this.database.readerPool.getWorker();
-    }
+      // Read-only Pool
+      // We assume readerPool exists if we passed the fallback check above
+      const workerId = await this.db.readerPool.getWorkerId();
+      workerClient = this.db.readerPool.workers.find((w) => w.id === workerId);
 
-    // LOCK THE WORKER
-    if (!this.database.inTransaction) {
+      // We MUST lock/pin this reader to prevent LB interruption
       await workerClient.lock();
+      manualLock = true;
     }
 
     const iteratorId = Math.random().toString(36).slice(2);
@@ -410,7 +479,7 @@ class Statement {
       workerClient
         .noLockExecute({ action: "iterator_close", iteratorId })
         .catch(() => {});
-      if (!this.database.inTransaction) {
+      if (manualLock) {
         workerClient.unlock();
       }
     }

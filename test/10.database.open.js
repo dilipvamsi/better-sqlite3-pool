@@ -120,7 +120,7 @@ describe("new Database()", function () {
     expect(fs.existsSync(util.next())).to.be.false;
     await expectTypeError(Database.create(":memory:", { readonly: true }));
     await expectTypeError(Database.create("", { readonly: true }));
-    // await expectTypeError(Database.create(util.current()));
+    expect(fs.existsSync(util.current())).to.be.false;
   });
 
   it('should accept the "fileMustExist" option', async function () {
@@ -172,13 +172,19 @@ describe("new Database()", function () {
     const testTimeout = async (timeout) => {
       const db = await Database.create(util.current(), { timeout });
       try {
+        let dbCon;
         const start = Date.now();
         // Attempt to acquire lock on a busy DB
         try {
-          await db.exec("BEGIN EXCLUSIVE");
+          dbCon = await db.acquire();
+          await dbCon.exec("BEGIN EXCLUSIVE");
           throw new Error("Should have thrown SQLITE_BUSY");
         } catch (err) {
           expect(err).to.have.property("code", "SQLITE_BUSY");
+        } finally {
+          if (dbCon) {
+            await dbCon.release();
+          }
         }
         const end = Date.now();
         // GHA/CI is slow: allow a generous buffer
@@ -192,10 +198,12 @@ describe("new Database()", function () {
     const blocker = (this.db = await Database.create(util.next(), {
       timeout: 0x7fffffff,
     }));
-    await blocker.exec("BEGIN EXCLUSIVE");
+    const blockerConn = await blocker.acquire();
+    await blockerConn.exec("BEGIN EXCLUSIVE");
     // 2. Run the timing tests against the blocked file
     await testTimeout(0);
     await testTimeout(1000);
+    blockerConn.release();
     // 3. Cleanup blocker
     await blocker.close();
   });

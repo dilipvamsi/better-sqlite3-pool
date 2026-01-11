@@ -47,9 +47,10 @@ const kMultiWorker = Symbol("MultiWorker");
  * @typedef {Object} WorkerMessage
  * @description The raw message structure received from the Worker Thread.
  * @property {string} requestId - Unique ID correlating to a pending promise.
- * @property {'success' | 'done' | 'error' | 'next'} status - Outcome status.
+ * @property {'success' | 'done' | 'error' | 'next' | 'log' | 'ready'} status - Outcome status.
  * @property {any} [data] - Payload for success, done, or next events.
  * @property {SerializedError} [error] - Error details (if status is error).
+ * @property {boolean} [inTransaction] - Indicates if the statement is within a transaction.
  */
 
 /**
@@ -101,8 +102,9 @@ const kMultiWorker = Symbol("MultiWorker");
  * Worker Client Options
  * @typedef {Object} WorkerClientOptions
  * @property {WorkerConfig & {mode: 'read' | 'write'}} workerData - Worker configuration data.
- * @property {boolean} useMutex - Flag indicating if mutex should be used.
- * @property {(message: LogMessage) => void | undefined} onLog - Callback function for logging messages.
+ * @property {boolean} [useMutex] - Flag indicating if mutex should be used.
+ * @property {(message: LogMessage) => void | undefined} [onLog] - Callback function for logging messages.
+ * @property {boolean} [autoRestart] - Flag indicating if worker should automatically restart on failure.
  */
 
 // =============================================================================
@@ -121,9 +123,10 @@ class SingleWorkerClient extends EventEmitter {
    * @param {Symbol} token - Internal security token.
    * @param {string} workerPath - The absolute or relative path to the worker script.
    * @param {WorkerClientOptions} workerOptions - Options for the Worker instance.
+   * @param {Function} initFn - Function to initialize the worker.
    * @throws {ReferenceError} If called directly without the correct token.
    */
-  constructor(token, workerPath, workerOptions) {
+  constructor(token, workerPath, workerOptions, initFn) {
     if (token !== kSingleWorker) {
       throw new ReferenceError(
         "Cannot instantiate SingleWorkerClient directly.",
@@ -132,6 +135,15 @@ class SingleWorkerClient extends EventEmitter {
     super();
 
     const { useMutex, onLog, ...nodeWorkerOpts } = workerOptions;
+
+    /** @type {WorkerClientOptions} used for creating / restarting the Worker instance. */
+    this.workerOptions = workerOptions;
+
+    /** @type {string} The absolute or relative path to the worker script. */
+    this.workerPath = workerPath;
+
+    /** @type {Function} Function to initialize the worker. */
+    this.initFn = initFn;
 
     /** @type {string} Generate a simple lightweight ID for the worker itself. */
     this.id = "w_" + Math.random().toString(36).slice(2, 7);
@@ -169,10 +181,17 @@ class SingleWorkerClient extends EventEmitter {
     /** @type {(msg: any) => void} logger callback for database verbose logs */
     this.onLog = onLog || null;
 
-    // Bind event handlers to maintain 'this' context
-    this.worker.on("message", this._handleMessage.bind(this));
-    this.worker.on("error", this._handleError.bind(this));
-    this.worker.on("exit", this._handleExit.bind(this));
+    /** @type {boolean} Indicates whether the worker has been initialized */
+    this.isInitialized = false;
+
+    /** @type {any[]} History of sticky commands (Pragmas, Keys) to replay on respawn */
+    this.stateHistory = [];
+
+    /** @type {boolean} If true, worker will automatically restart on failure */
+    this.autoRestart = workerOptions.autoRestart === true;
+
+    /** @type {boolean} Indicates whether the worker is currently in a transaction */
+    this.inTransaction = false;
   }
 
   /**
@@ -184,64 +203,114 @@ class SingleWorkerClient extends EventEmitter {
    * @param {(client: SingleWorkerClient) => Promise<void>} [initFn] - Async function(worker) => Promise<void>
    * @returns {Promise<SingleWorkerClient>}
    */
-  static create(workerPath, workerOptions = {}, initFn = null) {
-    return new Promise((resolve, reject) => {
-      // PASSING THE SECRET TOKEN
-      const client = new SingleWorkerClient(
-        kSingleWorker,
-        workerPath,
-        workerOptions,
-      );
+  static async create(workerPath, workerOptions = {}, initFn = null) {
+    const client = new SingleWorkerClient(
+      kSingleWorker,
+      workerPath,
+      workerOptions,
+      initFn,
+    );
+    // This waits for the worker to be fully Online + Initialized
+    await client._startWorker();
+    return client;
+  }
 
-      // Helper to finalize creation
-      const finalize = async () => {
+  /**
+   * Spawns the worker and handles the Boot Sequence.
+   * Used for BOTH initial creation and Auto-Restarts.
+   * @returns {Promise<void>} Resolves when worker is ready to accept queries.
+   */
+  async _startWorker() {
+    // 1. Cleanup old instance
+    if (this.worker) {
+      this.worker.removeAllListeners();
+      this.worker.terminate().catch(() => {});
+      this.worker = null;
+    }
+    // console.log(this.workerOptions);
+
+    const { useMutex, onLog, autoRestart, ...nodeOpts } = this.workerOptions;
+    this.worker = new Worker(this.workerPath, nodeOpts);
+
+    // 2. Attach Permanent Listeners
+    this.worker.on("message", this._handleMessage.bind(this));
+    this.worker.on("error", this._handleError.bind(this));
+    this.worker.on("exit", (code) => this._handleExit(code));
+
+    // 3. BOOT SEQUENCE
+    return new Promise((resolve, reject) => {
+      let settled = false;
+
+      const timeoutTimer = setTimeout(() => {
+        if (!settled) {
+          cleanup();
+          this.worker.terminate();
+          reject(new Error("Worker initialization timed out (10s)"));
+        }
+      }, 10000);
+
+      const cleanup = () => {
+        settled = true;
+        clearTimeout(timeoutTimer);
+        this.removeListener("ready", onReady);
+        this.removeListener("boot_error", onBootError);
+        this.worker.removeListener("exit", onBootExit);
+      };
+
+      const onReady = async () => {
+        cleanup();
         try {
-          if (initFn) {
-            // Run the custom initialization logic
-            await initFn(client);
+          // A. Run Custom Init Hook
+          if (!this._isInitialized && this.initFn) {
+            await this.initFn(this);
           }
-          resolve(client);
+
+          // Mark initialized to enable auto-restart for future crashes
+          this._isInitialized = true;
+
+          // B. Replay Sticky State
+          if (this.stateHistory.length > 0) {
+            for (const data of this.stateHistory) {
+              const requestId = `replay_${Date.now()}_${Math.random()}`;
+              this.worker.postMessage({ requestId, data });
+            }
+          }
+          resolve();
         } catch (err) {
-          // If init fails, terminate and reject
-          client.terminate();
+          this.worker.terminate();
           reject(err);
         }
       };
 
-      if (client.worker.threadId > 0) {
-        return finalize();
-      }
-
-      const cleanup = () => {
-        client.worker.removeListener("online", onOnline);
-        client.worker.removeListener("error", onError);
-        client.worker.removeListener("exit", onExit);
-      };
-
-      const onOnline = () => {
+      const onBootError = (err) => {
         cleanup();
-        finalize();
-      };
-
-      const onError = (err) => {
-        cleanup();
+        this.worker.terminate();
         reject(err);
       };
 
-      const onExit = (code) => {
+      const onBootExit = (code) => {
         cleanup();
         reject(new Error(`Worker exited with code ${code} during boot`));
       };
 
-      client.worker.on("online", onOnline);
-      client.worker.on("error", onError);
-      client.worker.on("exit", onExit);
+      this.on("ready", onReady);
+      this.on("boot_error", onBootError);
+      // Listen for exit directly to catch startup crashes
+      this.worker.on("exit", onBootExit);
     });
   }
 
   // ===========================================================================
   // LOCK MANAGEMENT
   // ===========================================================================
+
+  /**
+   * Checks if the internal mutex is currently locked.
+   * Used by Database/Connection to check status during cleanup.
+   */
+  isLocked() {
+    return this.mutex ? this.mutex.isLocked() : false;
+  }
 
   /**
    * Manually locks the worker.
@@ -287,9 +356,14 @@ class SingleWorkerClient extends EventEmitter {
    * Used for atomic, one-off operations (e.g. db.prepare().run()).
    * Acquires the mutex, runs the task, releases the mutex
    * @param {any} data - The data payload to send.
+   * @param {boolean} [sticky=false] - If true, replayed on worker restart.
    * @returns {Promise<any>} Resolves with the worker's result.
    */
-  async execute(data) {
+  async execute(data, sticky = false) {
+    if (sticky) {
+      this.stateHistory.push(data);
+    }
+
     // Acquire Lock (if enabled)
     if (this.mutex) {
       await this.mutex.acquire();
@@ -443,8 +517,28 @@ class SingleWorkerClient extends EventEmitter {
    * @private
    * @param {WorkerMessage} message - The worker message.
    */
-  _handleMessage({ requestId, status, data, error }) {
-    // --- CASE 0: LOGGING (Global, not strictly tied to request state) ---
+  _handleMessage({ requestId, status, data, error, inTransaction }) {
+    // If the worker reported a transaction state, update our local tracker.
+    if (typeof inTransaction === "boolean") {
+      this.inTransaction = inTransaction;
+    }
+
+    // --- READY ---
+    if (status === "ready") {
+      this.emit("ready");
+      return;
+    }
+    // --- BOOT ERROR ---
+    if (status === "boot_error") {
+      this.emit("boot_error", new Error(data));
+      return;
+    }
+    // --- SETUP ERROR ---
+    if (status === "setup_error") {
+      this.emit("error", new Error(data));
+      return;
+    }
+    // --- LOGGING (Global, not strictly tied to request state) ---
     if (status === "log") {
       if (typeof this.onLog === "function") {
         this.onLog(data);
@@ -452,6 +546,7 @@ class SingleWorkerClient extends EventEmitter {
       return;
     }
 
+    // --- Other logs
     if (!this.requestMap.has(requestId)) return;
     const task = this.requestMap.get(requestId);
 
@@ -525,7 +620,9 @@ class SingleWorkerClient extends EventEmitter {
    * @param {Error} err
    */
   _handleError(err) {
-    this._flushRequests(new SqliteError(err.message, "SQLITE_ERROR"));
+    console.error(`[better-sqlite3-pool] Worker ${this.id} error:`, err);
+    // Flush current requests with the specific error
+    this._flushRequests(this._createErrorByType(err));
   }
 
   /**
@@ -534,12 +631,39 @@ class SingleWorkerClient extends EventEmitter {
    * @param {number} code - Exit code.
    */
   _handleExit(code) {
-    const err = new SqliteError(
-      `Worker exited code ${code}`,
-      "SQLITE_INTERNAL",
+    // 0 = Intentional close (usually)
+    if (code === 0) {
+      this._flushRequests(new Error("Worker closed cleanly"));
+      this.emit("exit", code);
+      return;
+    }
+
+    console.warn(
+      `[better-sqlite3-pool] Worker ${this.id} crashed (code ${code}).`,
     );
-    this._flushRequests(err);
-    this.emit("exit", code);
+
+    // 1. Fail all pending requests immediately
+    // If we don't do this, clients waiting on Promises will hang until timeout
+    this._flushRequests(
+      new SqliteError(`Worker crashed with code ${code}`, "SQLITE_INTERNAL"),
+    );
+
+    // 2. Restart Logic
+    if (this.autoRestart) {
+      // SCENARIO A: WRITER (Self-Healing)
+      this.emit("restart"); // Notify DB to clear transaction flags
+
+      this._startWorker().catch((err) => {
+        console.error(
+          "[better-sqlite3-pool] Fatal: Failed to respawn worker:",
+          err,
+        );
+        this.emit("error", err); // Global error, DB is likely unusable now
+      });
+    } else {
+      // SCENARIO B: READER POOL (Managed)
+      this.emit("exit", code);
+    }
   }
 
   /**
@@ -553,14 +677,32 @@ class SingleWorkerClient extends EventEmitter {
       task.reject(err);
     }
     this.requestMap.clear();
+    this.activeRequests = 0;
   }
 
   /**
    * Gracefully terminates the underlying worker thread.
    * @returns {Promise<number>} Exit code.
    */
-  terminate() {
-    return this.worker.terminate();
+  async terminate() {
+    if (this.worker) {
+      // 1. Prevent Auto-Restart:
+      // Remove the exit listener so _handleExit doesn't run when we kill it.
+      this.worker.removeAllListeners("exit");
+      this.worker.removeAllListeners("error");
+
+      // 2. Reject pending work:
+      this._flushRequests(new Error("Worker terminated"));
+
+      // 3. PREVENT AUTO-RESTART
+      // We are shutting down. If the writer crashes during this process,
+      // we do NOT want it to respawn.
+      this.autoRestart = false;
+
+      // 3. Kill thread:
+      return this.worker.terminate();
+    }
+    return Promise.resolve();
   }
 }
 
@@ -602,7 +744,9 @@ class MultiWorkerClient extends EventEmitter {
     this.workerPath = workerPath;
 
     /** @type {WorkerOptions} Worker options. */
-    this.workerOptions = workerOptions;
+    this.workerOptions = workerOptions
+      ? { ...workerOptions, autoRestart: false }
+      : {};
 
     /** @type {number} Minimum number of workers to keep alive. */
     this.minWorkers = minWorkers;
@@ -671,8 +815,7 @@ class MultiWorkerClient extends EventEmitter {
       initPromises.push(pool._spawnWorker());
     }
 
-    const readyWorkers = await Promise.all(initPromises);
-    pool.workers.push(...readyWorkers);
+    await Promise.all(initPromises);
 
     return pool;
   }
@@ -733,7 +876,6 @@ class MultiWorkerClient extends EventEmitter {
 
       // Add to pool and collect IDs
       newWorkers.forEach((w) => {
-        this.workers.push(w);
         newWorkerIds.push(w.id);
       });
 
@@ -744,6 +886,7 @@ class MultiWorkerClient extends EventEmitter {
 
     // Process queue in case the increased limits allow pending tasks to run
     this._processQueue();
+    return newWorkerIds;
   }
 
   /**
@@ -927,6 +1070,14 @@ class MultiWorkerClient extends EventEmitter {
         this.workerOptions,
         this.initFn,
       );
+
+      // Race Condition Handling
+      // If the pool was closed while this worker was spinning up, kill it immediately.
+      // Otherwise, it becomes a zombie thread that prevents the process from exiting.
+      if (this.isClosing) {
+        await worker.terminate();
+        return null;
+      }
 
       // 2. Replay History (Sticky Broadcasts)
       // This ensures new workers have the correct PRAGMAs

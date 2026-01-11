@@ -5,7 +5,8 @@
   "main": "./src/index.js",
   "types": "./src/index.d.ts",
   "scripts": {
-    "test": "mocha --exit --slow=75 --timeout=30000"
+    "test": "mocha --exit --slow=75 --timeout=30000",
+    "test:file": "mocha --exit --slow=75 --timeout=30000 test/00.setup.js"
   },
   "engines": {
     "node": "20.x || 22.x || 23.x || 24.x"

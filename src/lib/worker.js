@@ -367,7 +367,7 @@ try {
   // Report initialization error to pool
   if (parentPort) {
     parentPort.postMessage({
-      status: "error",
+      status: "boot_error",
       error: formatError(err),
     });
     process.exit(1);
@@ -385,7 +385,7 @@ try {
 } catch (err) {
   if (parentPort) {
     parentPort.postMessage({
-      status: "error",
+      status: "setup_error",
       error: formatError(err),
     });
   }
@@ -394,7 +394,10 @@ try {
 // Enable BigInt support for large integers
 // db.defaultSafeIntegers(true);
 
-if (parentPort) parentPort.postMessage({ status: "ready" });
+if (parentPort) {
+  // console.log(`${mode}: is ready`);
+  parentPort.postMessage({ status: "ready" });
+}
 
 // =============================================================================
 // STATE MANAGEMENT
@@ -409,6 +412,16 @@ const activeStreams = new Map();
 
 if (parentPort) {
   parentPort.on("message", handleMessage);
+}
+
+function send(response) {
+  if (parentPort) {
+    // Capture the ACTUAL physical transaction state from SQLite
+    if (db && typeof db.inTransaction === "boolean") {
+      response.inTransaction = db.inTransaction;
+    }
+    parentPort.postMessage(response);
+  }
 }
 
 /**
@@ -429,7 +442,7 @@ function handleMessage({ requestId, data }) {
           status: "success",
           data: result,
         };
-        parentPort.postMessage(res);
+        send(res);
         break;
       }
       case "get":
@@ -442,14 +455,14 @@ function handleMessage({ requestId, data }) {
           status: "success",
           data: result,
         };
-        parentPort.postMessage(res);
+        send(res);
         break;
       }
       case "exec": {
         processExec(data);
         /** @type {ResponseVoid} */
         const res = { requestId, action: "exec", status: "success" };
-        parentPort.postMessage(res);
+        send(res);
         break;
       }
       case "pragma": {
@@ -461,28 +474,28 @@ function handleMessage({ requestId, data }) {
           status: "success",
           data: result,
         };
-        parentPort.postMessage(res);
+        send(res);
         break;
       }
       case "key": {
         processKey(data);
         /** @type {ResponseVoid} */
         const res = { requestId, action: "key", status: "success" };
-        parentPort.postMessage(res);
+        send(res);
         break;
       }
       case "rekey": {
         processRekey(data);
         /** @type {ResponseVoid} */
         const res = { requestId, action: "rekey", status: "success" };
-        parentPort.postMessage(res);
+        send(res);
         break;
       }
       case "load_extension": {
         processload_extension(data);
         /** @type {ResponseVoid} */
         const res = { requestId, action: "load_extension", status: "success" };
-        parentPort.postMessage(res);
+        send(res);
         break;
       }
       case "serialize": {
@@ -494,7 +507,7 @@ function handleMessage({ requestId, data }) {
           status: "success",
           data: result,
         };
-        parentPort.postMessage(res);
+        send(res);
         break;
       }
       case "backup": {
@@ -506,14 +519,14 @@ function handleMessage({ requestId, data }) {
         processTable(data);
         /** @type {ResponseVoid} */
         const res = { requestId, action: "table", status: "success" };
-        parentPort.postMessage(res);
+        send(res);
         break;
       }
       case "unsafe_mode": {
         processUnsafeMode(data);
         /** @type {ResponseVoid} */
         const res = { requestId, action: "unsafe_mode", status: "success" };
-        parentPort.postMessage(res);
+        send(res);
         break;
       }
       case "default_safe_integers": {
@@ -521,10 +534,10 @@ function handleMessage({ requestId, data }) {
         /** @type {ResponseVoid} */
         const res = {
           requestId,
-          action: "defaultSafeIntegers",
+          action: "default_safe_integers",
           status: "success",
         };
-        parentPort.postMessage(res);
+        send(res);
         break;
       }
       case "iterator_open": {
@@ -536,7 +549,7 @@ function handleMessage({ requestId, data }) {
           status: "success",
           data: result,
         };
-        parentPort.postMessage(res);
+        send(res);
         break;
       }
       case "iterator_next": {
@@ -548,35 +561,35 @@ function handleMessage({ requestId, data }) {
           status: "success",
           data: result,
         };
-        parentPort.postMessage(res);
+        send(res);
         break;
       }
       case "iterator_close": {
         processIteratorClose(data);
         /** @type {ResponseVoid} */
         const res = { requestId, action: "iterator_close", status: "success" };
-        parentPort.postMessage(res);
+        send(res);
         break;
       }
       case "function": {
         processFunction(data);
         /** @type {ResponseVoid} */
         const res = { requestId, action: "function", status: "success" };
-        parentPort.postMessage(res);
+        send(res);
         break;
       }
       case "aggregate": {
         processAggregate(data);
         /** @type {ResponseVoid} */
         const res = { requestId, action: "aggregate", status: "success" };
-        parentPort.postMessage(res);
+        send(res);
         break;
       }
       case "close": {
         processClose();
         /** @type {ResponseVoid} */
         const res = { requestId, action: "close", status: "success" };
-        parentPort.postMessage(res);
+        send(res);
         break;
       }
       default:
@@ -591,7 +604,9 @@ function handleMessage({ requestId, data }) {
       status: "error",
       error: formatError(err),
     };
-    parentPort.postMessage(res);
+    // console.log(data);
+    // console.log(err);
+    send(res);
   }
 }
 

@@ -11,8 +11,13 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
 const path = require("node:path");
 const EventEmitter = require("events");
 const Statement = require("./statement");
-const { createError, fileExists, parentDirectoryExists } = require("./utils");
+const {
+  fileExists,
+  parentDirectoryExists,
+  serializeAggregateOptions,
+} = require("./utils");
 const { SingleWorkerClient, MultiWorkerClient } = require("./worker-pool");
+const Connection = require("./connection");
 
 // =============================================================================
 // INTERNAL TYPE DEFINITIONS
@@ -251,10 +256,13 @@ class Database extends EventEmitter {
 
   /**
    * Getter to check if the CURRENT async execution context is inside a transaction.
+   * Updated to reflect the actual physical state of the Writer worker.
    * @returns {boolean}
    */
   get inTransaction() {
-    return this.transactionContext.getStore() === true;
+    // Returns true if the Writer worker reports it is inside a transaction.
+    // Falls back to false if writer is not initialized (e.g. readonly mode or booting).
+    return this.writer ? this.writer.inTransaction : false;
   }
 
   /**
@@ -280,7 +288,7 @@ class Database extends EventEmitter {
           useMutex: true, // <--- CRITICAL: Transactions/Writes must be serialized.
           onLog,
         },
-        this._workerInitCheck, // Custom hook to wait for "ready" message
+        null, // Custom hook to wait for "ready" message
       );
     }
 
@@ -296,40 +304,13 @@ class Database extends EventEmitter {
           useMutex: false, // <--- CRITICAL: Readers must be parallel. No Mutex.
           onLog,
         },
-        this._workerInitCheck, // Custom hook to wait for "ready" message per worker
+        null, // Custom hook to wait for "ready" message per worker
       );
     }
 
     this.open = true;
+    // console.log("Database is ready");
     this.emit("open");
-  }
-
-  /**
-   * Initialization hook for Worker Clients.
-   * Waits for the SQLite worker script to send { status: 'ready' }.
-   * This ensures the Promise returned by create() doesn't resolve until the DB is truly usable.
-   * @param {SingleWorkerClient} client
-   */
-  async _workerInitCheck(client) {
-    return new Promise((resolve, reject) => {
-      const handler = (msg) => {
-        if (msg.status === "ready") {
-          client.worker.off("message", handler);
-          resolve();
-        } else if (msg.status === "error") {
-          client.worker.off("message", handler);
-          reject(createError(msg.error));
-        }
-      };
-
-      client.worker.on("message", handler);
-
-      // Failsafe timeout
-      setTimeout(() => {
-        client.worker.off("message", handler);
-        reject(new Error("Worker initialization timed out (10s)"));
-      }, 10000);
-    });
   }
 
   /**
@@ -340,6 +321,29 @@ class Database extends EventEmitter {
     if (!this.open) {
       throw new TypeError("The database connection is not open");
     }
+  }
+
+  /**
+   * ACQUIRE WRITE LOCK
+   * Returns a Connection object that holds the exclusive lock on the writer.
+   * The caller MUST ensure `conn.release()` is called (or use `await using`).
+   * @returns {Promise<Connection>}
+   */
+  async acquire() {
+    this._ensureOpen();
+    if (this.readonly) {
+      throw new SqliteError(
+        "Cannot acquire write connection in readonly mode",
+        "SQLITE_READONLY",
+      );
+    }
+
+    // Return the session wrapper
+    return Connection.create(
+      this,
+      this.connectionMaxLife,
+      this.connectionIdleTimeout,
+    );
   }
 
   /**
@@ -369,112 +373,122 @@ class Database extends EventEmitter {
    * Execute a function within a transaction.
    * Supports nested transactions via SAVEPOINT.
    *
+   * Returns a wrapper function that, when executed, spins up the transaction.
+   * The wrapper also has properties (.immediate, .exclusive) to change locking behavior.
+   *
    * @param {Function} fn - Async function to execute.
-   * @returns {Function} - A wrapper function that executes the transaction.
+   * @returns {Function} - A wrapper function.
    */
   transaction(fn) {
     if (typeof fn !== "function") throw new TypeError("Expected a function");
     this._ensureOpen();
 
-    // Helper to generate the specific wrapper
-    const createWrapper = (defaultBehavior) => {
+    // Helper to generate the specific wrapper based on locking behavior
+    const createWrapper = (behavior) => {
       return async (...args) => {
-        this._ensureOpen();
+        // 1. Check for Active Context (Nested Transaction)
+        // If we are already inside a transaction, we reuse that connection
+        // and use SAVEPOINTs. The 'behavior' arg is ignored for nested calls.
+        const parentConn = this.transactionContext.getStore();
 
-        // Check if we are the Root Transaction (First one)
-        const isRoot = !this.inTransaction;
-
-        const runTransaction = async () => {
-          // 1. Acquire Lock (only if root)
-          // This blocks all other writes until this transaction finishes.
-          if (!this.writer) throw new Error("Writer not initialized");
-          if (isRoot) await this.writer.lock();
-
-          let savepointName = null;
-
+        if (parentConn) {
+          const savepointName = `sp_${this._spId++}`;
           try {
-            // 2. BEGIN / SAVEPOINT
-            if (isRoot) {
-              // Use the requested behavior for the root transaction
-              await this.writer.noLockExecute({
-                action: "exec",
-                sql: `BEGIN ${defaultBehavior}`,
-              });
-            } else {
-              // Nested transactions always use SAVEPOINT
-              savepointName = `sp_${this._spId++}`;
-              await this.writer.noLockExecute({
-                action: "exec",
-                sql: `SAVEPOINT ${savepointName}`,
-              });
-            }
-
-            // 3. Execute User Function
+            await parentConn.exec(`SAVEPOINT ${savepointName}`);
             const result = await fn(...args);
-
-            // 4. COMMIT / RELEASE
-            if (isRoot) {
-              await this.writer.noLockExecute({
-                action: "exec",
-                sql: "COMMIT",
-              });
-            } else {
-              await this.writer.noLockExecute({
-                action: "exec",
-                sql: `RELEASE ${savepointName}`,
-              });
-            }
+            await parentConn.exec(`RELEASE ${savepointName}`);
             return result;
           } catch (err) {
-            // 5. ROLLBACK
             try {
-              if (isRoot) {
-                await this.writer.noLockExecute({
-                  action: "exec",
-                  sql: "ROLLBACK",
-                });
-              } else {
-                await this.writer.noLockExecute({
-                  action: "exec",
-                  sql: `ROLLBACK TO ${savepointName}`,
-                });
-              }
-            } catch (rollbackErr) {
-              // If rollback fails (e.g. DB crashed), we can't do much, but we should prioritize original error
-              console.error("Rollback failed:", rollbackErr);
+              await parentConn.exec(`ROLLBACK TO ${savepointName}`);
+            } catch (e) {
+              /* ignore rollback errors */
+            }
+            throw err;
+          }
+        }
+
+        // 2. Root Transaction (New Connection)
+        // We acquire a new exclusive connection from the pool.
+        const conn = await this.acquire();
+
+        // Wrap execution in AsyncLocalStorage context so internal queries find 'conn'
+        return this.transactionContext.run(conn, async () => {
+          try {
+            // Start the transaction with the specific locking behavior
+            // (DEFERRED, IMMEDIATE, or EXCLUSIVE)
+            await conn.exec(`BEGIN ${behavior}`);
+
+            const result = await fn(...args);
+
+            await conn.exec("COMMIT");
+            return result;
+          } catch (err) {
+            try {
+              await conn.exec("ROLLBACK");
+            } catch (e) {
+              console.error(
+                "[better-sqlite3-pool] Rollback failed:",
+                e.message,
+              );
             }
             throw err;
           } finally {
-            // 6. Release Lock (only if root)
-            if (isRoot) this.writer.unlock();
+            // Always release the connection lock
+            conn.release();
           }
-        };
-
-        // MAGIC HAPPENS HERE:
-        // We wrap the execution in transactionContext.run(true, ...)
-        // Any async operation inside 'runTransaction' (and 'fn') will see
-        // this.inTransaction as TRUE.
-        // Any parallel request outside this scope will see FALSE.
-        if (isRoot) {
-          return this.transactionContext.run(true, runTransaction);
-        } else {
-          // Already inside a context, just run
-          return runTransaction();
-        }
+        });
       };
     };
 
-    // The default wrapper uses IMMEDIATE (better for concurrency to avoid deadlocks in WAL)
+    // Default behavior: IMMEDIATE
+    // This helps avoid SQLITE_BUSY deadlocks in WAL mode by acquiring the write lock upfront.
     const wrapper = createWrapper("IMMEDIATE");
 
-    // Attach specific behaviors per better-sqlite3 API
-    wrapper.default = createWrapper("DEFERRED"); // SQLite default is actually DEFERRED
+    // Attach specific behaviors to match better-sqlite3 API
+    wrapper.default = createWrapper("DEFERRED"); // SQLite default
     wrapper.deferred = createWrapper("DEFERRED");
     wrapper.immediate = createWrapper("IMMEDIATE");
     wrapper.exclusive = createWrapper("EXCLUSIVE");
 
-    // @ts-ignore
     return wrapper;
+  }
+
+  /**
+   * Helper to broadcast configuration (Pragmas, Functions, Keys) to all workers.
+   * Ensures settings persist across worker restarts (Sticky).
+   *
+   * @param {Object} payload - The data payload.
+   */
+  async _execConfig(payload) {
+    this._ensureOpen();
+    const promises = [];
+
+    // 1. Broadcast to Reader Pool (if exists)
+    // We use sticky=true so new readers get this config on spawn
+    if (this.readerPool) {
+      promises.push(this.readerPool.broadcast(payload, true));
+    }
+
+    // 2. Apply to Writer
+    if (this.writer) {
+      const activeConn = this.transactionContext.getStore();
+
+      // CASE A: Inside a Transaction
+      // We cannot acquire the lock (we already hold it).
+      // We cannot use 'sticky' execution (modifying history mid-transaction is risky).
+      // We just execute it ephemerally.
+      if (activeConn) {
+        promises.push(this.writer.noLockExecute(payload, true));
+      }
+      // CASE B: Standard Config Change
+      // Execute, and mark as STICKY so it replays if writer crashes.
+      else {
+        promises.push(this.writer.execute(payload, true));
+      }
+    }
+
+    await Promise.all(promises);
   }
 
   // =================================================================
@@ -487,16 +501,8 @@ class Database extends EventEmitter {
    * @param {string|Buffer} key
    */
   async key(key) {
-    this._ensureOpen();
-    // Action 'key' needs to be broadcast to ALL workers (Writer + Readers)
     const payload = { action: "key", key };
-
-    const promises = [];
-    if (this.readerPool)
-      promises.push(this.readerPool.broadcast(payload, true)); // Sticky!
-    if (this.writer) promises.push(this.writer.execute(payload));
-
-    await Promise.all(promises);
+    await this._execConfig(payload);
   }
 
   /**
@@ -504,18 +510,8 @@ class Database extends EventEmitter {
    * @param {string|Buffer} key
    */
   async rekey(key) {
-    this._ensureOpen();
     const payload = { action: "rekey", key };
-
-    // Rekey usually requires write access, but all connections need to update.
-    // However, usually rekey is done on the main connection.
-    // For a pool, this is complex. We will broadcast to ensure all connections update.
-    const promises = [];
-    if (this.readerPool)
-      promises.push(this.readerPool.broadcast(payload, true));
-    if (this.writer) promises.push(this.writer.execute(payload));
-
-    await Promise.all(promises);
+    await this._execConfig(payload);
   }
 
   /**
@@ -524,16 +520,8 @@ class Database extends EventEmitter {
    * @param {boolean} [toggleState=true]
    */
   async defaultSafeIntegers(toggleState = true) {
-    this._ensureOpen();
-    const payload = { action: "defaultSafeIntegers", state: toggleState };
-
-    const promises = [];
-    if (this.readerPool)
-      promises.push(this.readerPool.broadcast(payload, true));
-    if (this.writer) promises.push(this.writer.execute(payload));
-
-    await Promise.all(promises);
-    return this;
+    const payload = { action: "default_safe_integers", state: toggleState };
+    await this._execConfig(payload);
   }
 
   /**
@@ -541,16 +529,8 @@ class Database extends EventEmitter {
    * @param {string} path
    */
   async loadExtension(path) {
-    this._ensureOpen();
     const payload = { action: "load_extension", path };
-
-    // Must broadcast to ALL. If one worker has it and another doesn't, behavior is inconsistent.
-    const promises = [];
-    if (this.readerPool)
-      promises.push(this.readerPool.broadcast(payload, true));
-    if (this.writer) promises.push(this.writer.execute(payload));
-
-    await Promise.all(promises);
+    await this._execConfig(payload);
   }
 
   /** @typedef {import('better-sqlite3-multiple-ciphers').Database.RegistrationOptions} RegistrationOptions */
@@ -565,8 +545,6 @@ class Database extends EventEmitter {
    * @returns {Promise<this>} The Database instance.
    */
   async function(name, options, fn) {
-    this._ensureOpen();
-
     // Argument shuffling to support optional 'options'
     let callback = fn;
     let opts = options;
@@ -590,19 +568,7 @@ class Database extends EventEmitter {
       fnOptions: opts,
     };
 
-    const promises = [];
-
-    // 1. Send to Reader Pool (via broadcast with sticky=true)
-    if (this.readerPool) {
-      promises.push(this.readerPool.broadcast(payload, true));
-    }
-
-    // 2. Send to Writer
-    if (this.writer) {
-      promises.push(this.writer.execute(payload));
-    }
-
-    await Promise.all(promises);
+    await this._execConfig(payload);
     return this;
   }
 
@@ -615,7 +581,6 @@ class Database extends EventEmitter {
    * @returns {Promise<this>}
    */
   async aggregate(aggName, options) {
-    this._ensureOpen();
     if (typeof aggName !== "string")
       throw new TypeError("Expected first argument to be a string");
     if (typeof options !== "object" || options === null)
@@ -629,21 +594,7 @@ class Database extends EventEmitter {
       aggName,
       aggOptions: serializeAggregateOptions(options),
     };
-
-    const promises = [];
-
-    // 1. Broadcast to Readers (Sticky)
-    if (this.readerPool) {
-      promises.push(this.readerPool.broadcast(payload, true));
-    }
-
-    // 2. Send to Writer
-    if (this.writer) {
-      // Use _requestWrite to ensure thread safety
-      promises.push(this._requestWrite("aggregate", payload));
-    }
-
-    await Promise.all(promises);
+    await this._execConfig(payload);
     return this;
   }
 
@@ -702,9 +653,27 @@ class Database extends EventEmitter {
 
     // WRITE MODE
     // 1. Execute on Writer (Primary) - This returns the actual pragma result
-    const writerRes = await this.writer.execute(payload);
+    let writerRes;
+    const activeConn = this.transactionContext.getStore();
 
-    // 2. Broadcast to Readers (Sticky) to keep them in sync with Writer settings
+    if (activeConn) {
+      // Inside transaction: We must use the active connection's writer access
+      // and NOT lock, because the transaction already holds the lock.
+      // We call noLockExecute directly to get the return value.
+      writerRes = await activeConn.writer.noLockExecute(payload);
+
+      // We still need to broadcast to readers for consistency
+      if (this.readerPool) {
+        await this.readerPool.broadcast(payload, true);
+      }
+    } else {
+      // Atomic: Lock and make Sticky
+      // FIX: Do NOT manually lock here. writer.execute() handles locking internally.
+      // The original code wrapped this in this.writer.lock(), causing the deadlock.
+      writerRes = await this.writer.execute(payload, true);
+    }
+
+    // Sync Readers (Sticky)
     if (this.readerPool) {
       await this.readerPool.broadcast(payload, true);
     }
@@ -733,17 +702,9 @@ class Database extends EventEmitter {
    * @returns {Promise<this>} The Database instance.
    */
   async table(name, factory) {
-    this._ensureOpen();
     const factoryString = factory.toString();
     const payload = { action: "table", name, factoryString };
-    const promises = [];
-    if (this.readerPool) {
-      promises.push(this.readerPool.broadcast(payload, true));
-    }
-    if (this.writer) {
-      promises.push(this.writer.execute(payload));
-    }
-    await Promise.all(promises);
+    await this._execConfig(payload);
     return this;
   }
 
@@ -759,16 +720,8 @@ class Database extends EventEmitter {
    * @returns {Promise<this>} The Database instance.
    */
   async unsafeMode(unsafe = true) {
-    this._ensureOpen();
     const payload = { action: "unsafe_mode", on: unsafe };
-    const promises = [];
-    if (this.readerPool) {
-      promises.push(this.readerPool.broadcast(payload, true));
-    }
-    if (this.writer) {
-      promises.push(this.writer.execute(payload));
-    }
-    await Promise.all(promises);
+    await this._execConfig(payload);
     return this;
   }
 
@@ -799,7 +752,19 @@ class Database extends EventEmitter {
    */
   async backup(destinationFile, options = {}) {
     this._ensureOpen();
-    if (!this.writer) throw new Error("Writer not available");
+    if (typeof destinationFile !== "string") {
+      throw new TypeError("Expected destinationFile to be a string");
+    }
+    // We explicitly check if the current async context is inside a transaction wrapper.
+    if (this.inTransaction) {
+      throw new SqliteError(
+        "Cannot execute backup within a transaction",
+        "SQLITE_ERROR",
+      );
+    }
+    if (!this.writer) {
+      throw new Error("Writer not available");
+    }
 
     const { progress, ...workerOptions } = options;
     if (progress && typeof progress !== "function")
@@ -891,37 +856,52 @@ class Database extends EventEmitter {
    * @returns {Promise<this>}
    */
   async close() {
-    if (!this.open) {
-      return this;
+    if (!this.open) return this;
+
+    // 1. Force Release Locks
+    // If a transaction was active, we break the lock so we can send the close signal.
+    if (this.writer && this.writer.isLocked()) {
+      this.writer.unlock();
     }
 
     const closePayload = { action: "close" };
 
-    // 1. Graceful Close (Send 'close' message to allow WAL checkpointing)
+    // 3. Graceful Shutdown Helper
+    const forceCloseWorker = async (client) => {
+      try {
+        // Use noLockExecute to ensure message sends even if logic thinks it's busy
+        await client.noLockExecute(closePayload);
+      } catch (e) {
+        /* ignore dead worker */
+      }
+    };
+
+    // console.log("Graceful shutdown initiated");
+
     try {
-      const promises = [];
+      // Close Readers first (allows WAL checkpointing)
       if (this.readerPool) {
-        await this.readerPool.broadcast(closePayload);
+        const promises = this.readerPool.workers.map((w) =>
+          forceCloseWorker(w),
+        );
+        await Promise.all(promises);
       }
+      // Close Writer last
       if (this.writer) {
-        await this.writer.execute(closePayload);
+        await forceCloseWorker(this.writer);
       }
-
-      await Promise.race([
-        Promise.all(promises),
-        new Promise((r) => setTimeout(r, 1000)), // 1s timeout
-      ]);
     } catch (e) {
-      // Ignore errors during close (worker might be dead already)
+      /* ignore */
     }
 
-    // 2. Hard Termination
-    if (this.readerPool) {
-      await this.readerPool.close();
-    }
-    if (this.writer) {
-      await this.writer.terminate();
-    }
+    // console.log("Graceful shutdown completed");
+
+    // 4. Terminate Threads (Hard Kill)
+    const terminatePromises = [];
+    if (this.writer) terminatePromises.push(this.writer.terminate());
+    if (this.readerPool) terminatePromises.push(this.readerPool.close());
+
+    await Promise.all(terminatePromises);
 
     this.writer = null;
     this.readerPool = null;
@@ -936,22 +916,6 @@ class Database extends EventEmitter {
   // ===========================================================================
 
   /**
-   * Helper to broadcast a payload to ALL workers (Writer + Readers).
-   * @param {Object} payload
-   * @returns {Promise<void>}
-   * @private
-   */
-  async _broadcast(payload) {
-    const readPromises = this.readers.map((r) => this._postReader(r, payload));
-    if (this.writer) {
-      const writePromise = this._postWriter(payload);
-      await Promise.all([writePromise, ...readPromises]);
-    } else {
-      await Promise.all(readPromises);
-    }
-  }
-
-  /**
    * Routes a Write request (INSERT/UPDATE/DELETE/PRAGMA).
    * @param {string} action - The action type (e.g., 'run', 'exec').
    * @param {string|Object} sqlOrPayload - The SQL or statement payload.
@@ -961,8 +925,6 @@ class Database extends EventEmitter {
    */
   async _requestWrite(action, sqlOrPayload, params) {
     this._ensureOpen();
-
-    // Check for Read-Only mode violation
     if (this.readonly) {
       throw new SqliteError(
         "attempt to write a readonly database",
@@ -970,23 +932,37 @@ class Database extends EventEmitter {
       );
     }
 
-    // Safety check for writer availability (should be covered by _ensureOpen, but good to have)
-    if (!this.writer) {
-      throw new TypeError("The database connection is not open");
+    // 1. Check for Active Context (db.transaction wrapper)
+    // If we are inside a transaction, the lock is already held by the connection object.
+    // We route this query through that connection to bypass the lock check.
+    const activeConn = this.transactionContext.getStore();
+    if (activeConn) {
+      return activeConn._requestWrite(action, sqlOrPayload, params);
     }
 
-    const isObj = typeof sqlOrPayload === "object" && sqlOrPayload !== null;
-    const payload = isObj
-      ? { action, ...sqlOrPayload }
-      : { action, sql: sqlOrPayload, params, options: undefined };
-
-    // SCENARIO 1: Inside a transaction (we own the lock)
-    if (this.inTransaction) {
-      return this.writer.noLockExecute(payload);
+    // 2. Safety Check: Forbid Raw BEGIN on global scope
+    // Manual transactions MUST use 'await db.acquire()' to ensure they get released.
+    const sql =
+      typeof sqlOrPayload === "string" ? sqlOrPayload : sqlOrPayload.sql;
+    if (typeof sql === "string" && /^\s*BEGIN/i.test(sql)) {
+      throw new Error(
+        "Manual transactions on the global 'db' instance are disabled. Use 'await db.acquire()' or 'db.transaction()'.",
+      );
     }
 
-    // SCENARIO 2: Stand-alone write (needs atomic lock)
-    return this.writer.execute(payload);
+    // 3. Atomic Execution
+    // This is a standard "One-Shot" write.
+    await this.writer.lock();
+    try {
+      const payload =
+        typeof sqlOrPayload === "object"
+          ? { action, ...sqlOrPayload }
+          : { action, sql: sqlOrPayload, params };
+
+      return await this.writer.noLockExecute(payload);
+    } finally {
+      this.writer.unlock();
+    }
   }
 
   /**
@@ -999,8 +975,17 @@ class Database extends EventEmitter {
    */
   async _requestRead(action, sqlOrPayload, params) {
     this._ensureOpen();
-    // In-Memory DBs or Single-Threaded mode fallback to Writer
+
+    // 1. Check for Active Context (Read-Your-Own-Writes)
+    const activeConn = this.transactionContext.getStore();
+    if (activeConn) {
+      // Route to Writer via Connection
+      return activeConn._requestRead(action, sqlOrPayload, params);
+    }
+
+    // 2. Fallback to Writer (Memory DB or No Pool)
     if (this.memory || (!this.readerPool && this.writer)) {
+      // Route to Writer (Atomic)
       return this._requestWrite(action, sqlOrPayload, params);
     }
 
@@ -1009,17 +994,12 @@ class Database extends EventEmitter {
     }
 
     const isObj = typeof sqlOrPayload === "object" && sqlOrPayload !== null;
-    const sql = isObj ? sqlOrPayload.sql : sqlOrPayload;
-    const options = isObj ? sqlOrPayload.options : undefined;
-    const payloadParams = isObj ? sqlOrPayload.params : params;
+    const payload = isObj
+      ? { action, ...sqlOrPayload }
+      : { action, sql: sqlOrPayload, params, options: undefined };
 
-    // Load Balanced Execution (No Mutex)
-    return this.readerPool.execute({
-      action,
-      sql,
-      params: payloadParams,
-      options,
-    });
+    // 3. Parallel Execution (Load Balanced)
+    return this.readerPool.execute(payload);
   }
 }
 
