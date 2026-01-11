@@ -207,7 +207,6 @@ describe("Statement#run()", function () {
       await stmt.run();
       throw new Error("Should have thrown SQLITE_READONLY");
     } catch (err) {
-      console.log(err);
       expect(err).to.have.property("code", "SQLITE_READONLY");
     }
   });

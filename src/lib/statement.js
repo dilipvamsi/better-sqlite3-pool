@@ -40,21 +40,45 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
  * Validates parameters to ensure they are compatible with better-sqlite3 constraints.
  * Specifically checks for custom class instances which are strictly forbidden.
  *
+ * NOTE: We do NOT check for parameter counts (RangeError) or missing named keys here.
+ * That requires knowing the SQL schema, so we let the Worker handle that.
+ *
  * @param {Array<any>} params
  * @throws {TypeError} If a parameter is an invalid object type.
  */
 function validateParams(params) {
-  for (const param of params) {
-    if (param !== null && typeof param === "object") {
-      // 1. Buffers are allowed
-      if (Buffer.isBuffer(param)) continue;
+  // REMOVED: Strict Arity Check for Named Parameters.
+  // We allow the worker (native better-sqlite3) to handle argument logic.
+  // We only filter types that break IPC serialization.
 
-      // 2. Arrays are allowed (as positional arguments list)
-      if (Array.isArray(param)) continue;
+  for (const p of params) {
+    const type = typeof p;
 
-      // 3. Plain Objects are allowed (as named parameters)
-      // We check prototype chain to detect custom classes or wrapped primitives (new Number(1))
-      const proto = Object.getPrototypeOf(param);
+    // 1. Undefined is not supported
+    if (type === "undefined") {
+      throw new TypeError(
+        "better-sqlite3-pool: Data type undefined is not supported.",
+      );
+    }
+
+    // 2. Functions are not supported (and cannot be cloned)
+    if (type === "function") {
+      throw new TypeError(
+        "better-sqlite3-pool: Data type function is not supported.",
+      );
+    }
+
+    // 3. Object Validation
+    if (p !== null && type === "object") {
+      // Buffers are valid
+      if (Buffer.isBuffer(p)) continue;
+
+      // Arrays are valid
+      if (Array.isArray(p)) continue;
+
+      // Plain Objects are valid
+      // We check for Custom Classes (instances of something other than Object)
+      const proto = Object.getPrototypeOf(p);
       if (proto !== Object.prototype && proto !== null) {
         throw new TypeError(
           "better-sqlite3-pool: Parameters must be primitives, Buffers, Arrays, or plain Objects.",
@@ -140,6 +164,9 @@ class Statement {
     /** @type {Array<any>} Default parameters bound via .bind() */
     this.boundParams = [];
 
+    /** @type {boolean} Indicates if the statement has been bound at least once. */
+    this._bound = false;
+
     // --- Configuration Flags (Default: False) ---
     /** @type {boolean} Return only the first column value. */
     this._pluck = false;
@@ -197,6 +224,11 @@ class Statement {
    */
   pluck(toggle = true) {
     this._pluck = toggle;
+    // Enforce mutual exclusivity: Enabling pluck disables raw/expand
+    if (toggle) {
+      this._raw = false;
+      this._expand = false;
+    }
     return this;
   }
 
@@ -207,6 +239,11 @@ class Statement {
    */
   raw(toggle = true) {
     this._raw = toggle;
+    // Enforce mutual exclusivity
+    if (toggle) {
+      this._pluck = false;
+      this._expand = false;
+    }
     return this;
   }
 
@@ -217,6 +254,11 @@ class Statement {
    */
   expand(toggle = true) {
     this._expand = toggle;
+    // Enforce mutual exclusivity
+    if (toggle) {
+      this._pluck = false;
+      this._raw = false;
+    }
     return this;
   }
 
@@ -237,8 +279,20 @@ class Statement {
    */
   bind(...params) {
     this.db._ensureOpen();
+    if (this._bound) {
+      throw new TypeError(
+        "The bind() method can only be invoked once per statement",
+      );
+    }
     validateParams(params);
-    this.boundParams = params;
+
+    // Snapshot parameters to prevent mutation affecting bound values (Permanent Binding)
+    this.boundParams = params.map((p) => {
+      if (Buffer.isBuffer(p)) return Buffer.from(p);
+      return p;
+    });
+
+    this._bound = true;
     return this;
   }
 
@@ -256,8 +310,14 @@ class Statement {
   async run(...params) {
     this.db._ensureOpen();
 
-    // Validate inputs BEFORE serialization strips the prototype info
-    if (params.length > 0) validateParams(params);
+    if (params.length > 0) {
+      if (this._bound) {
+        throw new TypeError(
+          "Cannot bind temporary parameters to a statement that already has bound parameters",
+        );
+      }
+      validateParams(params);
+    }
 
     const stmtParams = params.length ? params : this.boundParams;
     const payload = {
@@ -288,7 +348,14 @@ class Statement {
     this.db._ensureOpen();
 
     // Validate inputs BEFORE serialization strips the prototype info
-    if (params.length > 0) validateParams(params);
+    if (params.length > 0) {
+      if (this._bound) {
+        throw new TypeError(
+          "Cannot bind temporary parameters to a statement that already has bound parameters",
+        );
+      }
+      validateParams(params);
+    }
 
     const stmtParams = params.length ? params : this.boundParams;
 
@@ -362,7 +429,14 @@ class Statement {
     this.db._ensureOpen();
 
     // Validate inputs BEFORE serialization strips the prototype info
-    if (params.length > 0) validateParams(params);
+    if (params.length > 0) {
+      if (this._bound) {
+        throw new TypeError(
+          "Cannot bind temporary parameters to a statement that already has bound parameters",
+        );
+      }
+      validateParams(params);
+    }
 
     // 2. Delegate to the internal Async Generator
     return this._iterate(...params);
@@ -392,7 +466,7 @@ class Statement {
     let manualLock = false;
 
     // 1. Determine Worker
-    if (this.ctx instanceof Connection) {
+    if (this.ctx.constructor.name === "Connection") {
       // We are bound to an exclusive connection. Use its writer.
       workerClient = this.ctx.writer;
       // Do NOT call lock(), it is already locked by the Connection.
@@ -412,8 +486,7 @@ class Statement {
     } else {
       // Read-only Pool
       // We assume readerPool exists if we passed the fallback check above
-      const workerId = await this.db.readerPool.getWorkerId();
-      workerClient = this.db.readerPool.workers.find((w) => w.id === workerId);
+      workerClient = await this.db.readerPool.getWorker();
 
       // We MUST lock/pin this reader to prevent LB interruption
       await workerClient.lock();
