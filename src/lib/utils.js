@@ -53,37 +53,30 @@ function castRow(row, columns) {
  * @param {Object} errPayload - { message, code }
  * @returns {Error}
  */
-function createError(errPayload) {
-  // Guard against undefined/null payload
-  if (!errPayload) {
-    return new Error("Unknown Worker Error");
+function createErrorByType(error) {
+  // console.log(error);
+  switch (error.name) {
+    case "TypeError":
+      return new TypeError(error.message);
+    case "RangeError":
+      return new RangeError(error.message);
+    case "ReferenceError":
+      return new ReferenceError(error.message);
+    case "SyntaxError":
+      return new SyntaxError(error.message);
+    case "URIError":
+      return new URIError(error.message);
+    case "EvalError":
+      return new EvalError(error.message);
+    case "AggregateError":
+      return new AggregateError(error.message);
+    case "Error":
+      return new Error(error.message);
+    case "SqliteError":
+      return new SqliteError(error.message, error.code);
+    default:
+      return new Error(error.message);
   }
-
-  // 1. If it's already a SqliteError (e.g. caught locally), return it as-is.
-  if (errPayload instanceof SqliteError) {
-    return errPayload;
-  }
-
-  // 2. If it's a standard Error object (local), return it as-is.
-  if (errPayload instanceof Error) {
-    return errPayload;
-  }
-
-  // 3. Worker Payload (Structured Clone) handling
-  // Fallback to string if message is undefined (fixes "SqliteError: undefined")
-  const msg =
-    (errPayload && errPayload.message) ||
-    String(errPayload || "Unknown Worker Error");
-
-  const code = errPayload && errPayload.code;
-
-  if (code && typeof code === "string" && code.startsWith("SQLITE_")) {
-    return new SqliteError(msg, code);
-  }
-
-  const err = new Error(msg);
-  if (code) err.code = code; // Attach code if present (e.g. ENOENT)
-  return err;
 }
 
 /**
@@ -144,7 +137,7 @@ const serializeAggregateOptions = (opts) => {
 
 module.exports = {
   castRow,
-  createError,
+  createErrorByType,
   fileExists,
   parentDirectoryExists,
   serializeAggregateOptions,

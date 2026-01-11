@@ -20,6 +20,7 @@ const { Worker } = require("worker_threads");
 const { EventEmitter } = require("events");
 const { SqliteError } = require("better-sqlite3-multiple-ciphers");
 const Mutex = require("./mutex");
+const { createErrorByType } = require("./utils");
 
 // =============================================================================
 // INTERNAL SYMBOLS & CONSTANTS
@@ -486,32 +487,6 @@ class SingleWorkerClient extends EventEmitter {
   // ===========================================================================
 
   /**
-   * Create an error based on the type of error received.
-   * @private
-   * @param {SerializedError} error - The worker message.
-   */
-  _createErrorByType(error) {
-    switch (error.name) {
-      case "TypeError":
-        return new TypeError(error.message);
-      case "RangeError":
-        return new RangeError(error.message);
-      case "ReferenceError":
-        return new ReferenceError(error.message);
-      case "SyntaxError":
-        return new SyntaxError(error.message);
-      case "URIError":
-        return new URIError(error.message);
-      case "EvalError":
-        return new EvalError(error.message);
-      case "AggregateError":
-        return new AggregateError(error.message);
-      default:
-        return new SqliteError(error.message, error.code);
-    }
-  }
-
-  /**
    * Internal handler for incoming messages from the worker thread.
    * Dispatches results to the correct Promise or Stream Context.
    * @private
@@ -571,7 +546,7 @@ class SingleWorkerClient extends EventEmitter {
         }
       } else if (status === "error" || error) {
         // Error: Store error and wake iterator to throw it
-        ctx.error = this._createErrorByType(error);
+        ctx.error = createErrorByType(error);
         if (ctx.wake) {
           ctx.wake();
           ctx.wake = null;
@@ -598,7 +573,9 @@ class SingleWorkerClient extends EventEmitter {
     if (status === "success") {
       task.resolve(data);
     } else if (status === "error" || error) {
-      task.reject(this._createErrorByType(error));
+      const finalError = createErrorByType(error);
+      finalError.__data = data;
+      task.reject(finalError);
     } else if (status === "next" || status === "done") {
       // Protocol Violation: Standard request shouldn't get stream events
       task.reject(
@@ -622,7 +599,7 @@ class SingleWorkerClient extends EventEmitter {
   _handleError(err) {
     console.error(`[better-sqlite3-pool] Worker ${this.id} error:`, err);
     // Flush current requests with the specific error
-    this._flushRequests(this._createErrorByType(err));
+    this._flushRequests(createErrorByType(err));
   }
 
   /**

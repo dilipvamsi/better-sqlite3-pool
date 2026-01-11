@@ -541,25 +541,27 @@ function handleMessage({ requestId, data }) {
         break;
       }
       case "iterator_open": {
-        const result = processIteratorOpen(data);
+        const { result, error } = processIteratorOpen(data);
         /** @type {ResponseIterator} */
         const res = {
           requestId,
           action: "iterator_open",
-          status: "success",
+          status: error ? "error" : "success",
           data: result,
+          error,
         };
         send(res);
         break;
       }
       case "iterator_next": {
-        const result = processIteratorNext(data);
+        const { result, error } = processIteratorNext(data);
         /** @type {ResponseIterator} */
         const res = {
           requestId,
           action: "iterator_next",
-          status: "success",
+          status: error ? "error" : "success",
           data: result,
+          error,
         };
         send(res);
         break;
@@ -620,12 +622,8 @@ function handleMessage({ requestId, data }) {
  * @returns {ResultRun}
  */
 function processRun(payload) {
-  if (!isWriter) {
-    throwSqliteError(
-      "Cannot execute 'run' in read-only mode",
-      "SQLITE_READONLY",
-    );
-  }
+  // We rely on the native database 'readonly' mode to throw errors for writes.
+  // This allows ATTACH/DETACH to run on Reader workers.
   const stmt = prepareStatement(payload.sql, payload.options);
   // better-sqlite3 types define .run() returning RunResult directly
   return stmt.run(...(payload.params || []));
@@ -865,6 +863,7 @@ function getStreamBatch(iteratorId, iterator, columns) {
   const BATCH_SIZE = 50;
   const rows = [];
   let done = false;
+  let error;
 
   try {
     for (let i = 0; i < BATCH_SIZE; i++) {
@@ -876,13 +875,13 @@ function getStreamBatch(iteratorId, iterator, columns) {
       rows.push(next.value);
     }
   } catch (err) {
+    error = formatError(err);
     closeIterator(iteratorId);
-    throw err;
   }
 
   if (done) activeStreams.delete(iteratorId);
 
-  return { iteratorId, rows, columns, done };
+  return { result: { iteratorId, rows, columns, done }, error };
 }
 
 /**

@@ -326,6 +326,16 @@ class Statement {
       options: this._getOptions(),
     };
 
+    // SPECIAL HANDLING: ATTACH / DETACH
+    // These must be broadcast to ALL workers (Writer + Readers) to ensure
+    // the database schema is consistent across the entire pool.
+    if (/^\s*(ATTACH|DETACH)\b/i.test(this.source)) {
+      // Use _execConfig to broadcast and mark as sticky (persists on worker restart)
+      await this.ctx._execConfig({ ...payload, action: "run" });
+      // ATTACH/DETACH do not return row counts
+      return { changes: 0, lastInsertRowid: 0 };
+    }
+
     // 1. Read-Only Database Handling
     if (this.db.readonly) {
       // In readonly mode, we must send to the Reader Pool.
@@ -399,9 +409,32 @@ class Statement {
     // better-sqlite3 returns raw data from workers. We must cast BigInts/Buffers
     // back to their proper types if we are in 'default' object mode.
     // (raw/pluck modes usually don't strictly require this overhead or handle it differently)
-    if (!this._raw && !this._pluck && result.rows) {
-      // result.columns contains metadata needed for casting (e.g., distinguishing BLOBs)
-      result.rows.forEach((row) => castRow(row, result.columns));
+    if (result.rows) {
+      if (!this._raw && !this._pluck) {
+        // Standard Mode: Cast BigInts
+        result.rows.forEach((row) => castRow(row, result.columns));
+      } else if (this._pluck) {
+        // Pluck Mode: Restore Buffers if they became Uint8Array
+        for (let i = 0; i < result.rows.length; i++) {
+          if (
+            result.rows[i] instanceof Uint8Array &&
+            !Buffer.isBuffer(result.rows[i])
+          ) {
+            result.rows[i] = Buffer.from(result.rows[i]);
+          }
+        }
+      } else if (this._raw) {
+        // Raw Mode: Restore Buffers inside arrays
+        for (const row of result.rows) {
+          if (Array.isArray(row)) {
+            for (let i = 0; i < row.length; i++) {
+              if (row[i] instanceof Uint8Array && !Buffer.isBuffer(row[i])) {
+                row[i] = Buffer.from(row[i]);
+              }
+            }
+          }
+        }
+      }
     }
 
     return result.rows || [];
@@ -497,17 +530,23 @@ class Statement {
     let columns = null;
 
     this.busy = true; // Mark busy
-
     try {
-      // 1. OPEN STREAM (Get first batch)
-      let result = await workerClient.noLockExecute({
-        action: "iterator_open",
-        iteratorId,
-        sql: this.source,
-        params: stmtParams,
-        options: this._getOptions(),
-      });
-
+      let result;
+      let error;
+      try {
+        // 1. OPEN STREAM (Get first batch)
+        result = await workerClient.noLockExecute({
+          action: "iterator_open",
+          iteratorId,
+          sql: this.source,
+          params: stmtParams,
+          options: this._getOptions(),
+        });
+      } catch (err) {
+        // Even though error is raised valid rows are returned before the error
+        result = err.__data;
+        error = err;
+      }
       // Capture columns from first batch
       if (result.columns) {
         columns = result.columns;
@@ -528,14 +567,24 @@ class Statement {
         }
       }
 
+      if (error) {
+        throw error;
+      }
+
       // 2. CONSUME REST
       while (!result.done) {
-        // Request next batch
-        result = await workerClient.noLockExecute({
-          action: "iterator_next",
-          iteratorId,
-        });
-
+        try {
+          // Request next batch
+          result = await workerClient.noLockExecute({
+            action: "iterator_next",
+            iteratorId,
+          });
+        } catch (error) {
+          // Even though error is raised valid rows are returned before the error
+          result = err.__data;
+          error = err;
+        }
+        // console.log(result);
         if (result.rows && result.rows.length > 0) {
           const rows = result.rows;
           for (const row of rows) {
@@ -544,6 +593,9 @@ class Statement {
             }
             yield row;
           }
+        }
+        if (error) {
+          throw error;
         }
       }
     } finally {

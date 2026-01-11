@@ -427,10 +427,14 @@ class Database extends EventEmitter {
             try {
               await conn.exec("ROLLBACK");
             } catch (e) {
-              console.error(
-                "[better-sqlite3-pool] Rollback failed:",
-                e.message,
-              );
+              // FIX: Ignore "no transaction" errors.
+              // This happens if the transaction was killed internally (e.g. INSERT OR ROLLBACK)
+              if (!e.message.includes("no transaction is active")) {
+                console.error(
+                  "[better-sqlite3-pool] Rollback failed:",
+                  e.message,
+                );
+              }
             }
             throw err;
           } finally {
@@ -441,17 +445,33 @@ class Database extends EventEmitter {
       };
     };
 
-    // Default behavior: IMMEDIATE
-    // This helps avoid SQLITE_BUSY deadlocks in WAL mode by acquiring the write lock upfront.
-    const wrapper = createWrapper("IMMEDIATE");
+    // 1. Create distinct function instances for each behavior
+    const deferred = createWrapper("DEFERRED");
+    const immediate = createWrapper("IMMEDIATE");
+    const exclusive = createWrapper("EXCLUSIVE");
 
-    // Attach specific behaviors to match better-sqlite3 API
-    wrapper.default = createWrapper("DEFERRED"); // SQLite default
-    wrapper.deferred = createWrapper("DEFERRED");
-    wrapper.immediate = createWrapper("IMMEDIATE");
-    wrapper.exclusive = createWrapper("EXCLUSIVE");
+    // 2. Define the API structure (Circular references)
+    // Standard better-sqlite3 uses 'deferred' as the default.
+    const properties = {
+      default: deferred,
+      deferred: deferred,
+      immediate: immediate,
+      exclusive: exclusive,
+    };
 
-    return wrapper;
+    // 3. Attach properties to ALL wrappers so they are interchangeable
+    for (const wrapper of [deferred, immediate, exclusive]) {
+      Object.assign(wrapper, properties);
+
+      // Attach .database property to satisfy API compatibility
+      Object.defineProperty(wrapper, "database", {
+        value: this,
+        enumerable: true,
+        configurable: true,
+      });
+    }
+
+    return deferred;
   }
 
   /**
@@ -559,8 +579,37 @@ class Database extends EventEmitter {
     if (typeof callback !== "function")
       throw new TypeError("Expected second argument to be a function");
 
-    const fnString = fn.toString();
-    this._initFunctions.push({ name, fnString });
+    // -------------------------------------------------------------------------
+    // VALIDATE FUNCTION ARITY (ARGUMENT COUNT)
+    // -------------------------------------------------------------------------
+    // Native better-sqlite3 enforces that UDFs must have a valid argument count (0-100).
+    // It checks the '.length' property of the function object.
+    //
+    // CRITICAL: We must validate this HERE in the main thread.
+    // Why? Because we send the function to the worker using 'callback.toString()'.
+    // 'toString()' returns only the source code. If the user used 'Object.defineProperty'
+    // to manually set an invalid '.length' (e.g., -1 or 101) on the function object,
+    // that custom property is LOST during serialization. The worker would reconstruct
+    // the function with a valid default length (based on source args), bypassing the check.
+    if (!opts.varargs) {
+      const len = callback.length;
+
+      // Check for non-integers or negative numbers
+      if (!Number.isInteger(len) || len < 0) {
+        throw new TypeError(
+          "Expected function.length to be a non-negative integer",
+        );
+      }
+
+      // Check SQLite limit (max 100 arguments for UDFs)
+      if (len > 100) {
+        throw new RangeError(
+          "User-defined functions cannot have more than 100 arguments",
+        );
+      }
+    }
+
+    const fnString = callback.toString();
     const payload = {
       action: "function",
       fnName: name,
