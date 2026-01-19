@@ -71,12 +71,12 @@ describe("Database#pragma()", function () {
       -8000,
     );
     // original will fail as writer is running with wal mode
-    expect(await this.db.pragma("journal_mode", { simple: true })).to.equal(
-      "delete",
-    );
     // expect(await this.db.pragma("journal_mode", { simple: true })).to.equal(
-    //   "wal",
+    //   "delete",
     // );
+    expect(await this.db.pragma("journal_mode", { simple: true })).to.equal(
+      "wal",
+    );
     await this.db.pragma("journal_mode = wal");
     expect(await this.db.pragma("journal_mode", { simple: true })).to.equal(
       "wal",

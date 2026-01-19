@@ -7,7 +7,7 @@
  */
 
 const { AsyncLocalStorage } = require("node:async_hooks");
-const { SqliteError } = require("better-sqlite3-multiple-ciphers");
+const { SqliteError } = require("./utils");
 const path = require("node:path");
 const EventEmitter = require("events");
 const Statement = require("./statement");
@@ -578,9 +578,14 @@ class Database extends EventEmitter {
    * @param {string|Buffer} key
    */
   async rekey(key) {
+    if (!Buffer.isBuffer(key) && typeof key !== "string") {
+      throw new TypeError("Expected first argument to be a Buffer or String");
+    }
     // 1. Writer: Executes 'rekey' (rewrites database)
     if (this.writer) {
-      await this.writer.execute({ action: "rekey", key }, true);
+      await this.writer.execute({ action: "rekey", key });
+      // On the writer restart, we need key for the writer
+      await this.writer.execute({ action: "key", key }, true);
     }
 
     // 2. Readers: Execute 'key' (update internal handle to read new format)
@@ -605,6 +610,9 @@ class Database extends EventEmitter {
    * @param {string} path
    */
   async loadExtension(path) {
+    if (typeof path !== "string") {
+      throw new TypeError("Expected first argument to be a String");
+    }
     const payload = { action: "load_extension", path };
     await this._execConfig(payload);
   }
@@ -711,8 +719,13 @@ class Database extends EventEmitter {
   async serialize(options) {
     this._ensureOpen();
     // Always use the writer to get the most up-to-date state
-    const result = await this._requestWrite("serialize", { options });
-    return result; // The worker returns the Buffer
+    let result;
+    if (this.readonly) {
+      result = await this._requestRead("serialize", { options });
+    } else {
+      result = await this._requestWrite("serialize", { options });
+    }
+    return Buffer.from(result); // The worker returns the Buffer
   }
 
   /**
@@ -762,19 +775,24 @@ class Database extends EventEmitter {
     // SPECIAL HANDLING FOR 'REKEY' PRAGMA
     if (/^rekey\s*=/i.test(trimmedSql)) {
       let writerRes;
-      // 1. Writer: Execute as-is (Perform rewrite)
+
+      // 1. Readers: Convert 'rekey' to 'key'
+      const readerSql = trimmedSql.replace(/^rekey/i, "key");
+      const readerPayload = { action: "pragma", sql: readerSql, options };
+
+      // 2. Writer: Execute as-is (Perform rewrite)
       if (activeConn) {
         // Inside transaction
-        writerRes = await activeConn.writer.noLockExecute(payload, true);
+        writerRes = await activeConn.writer.noLockExecute(payload);
+        // On the writer restart, we need key for the writer
+        await activeConn.writer.noLockExecute(readerPayload, true);
       } else {
         // Atomic
         // Note: Not 'Sticky' because the file header persists this setting.
         writerRes = await this.writer.execute(payload, true);
+        // On the writer restart, we need key for the writer
+        await this.writer.execute(readerPayload, true);
       }
-
-      // 2. Readers: Convert 'rekey' to 'key'
-      const readerSql = trimmedSql.replace(/^rekey/i, "key");
-      const readerPayload = { action: "pragma", sql: readerSql, options };
 
       if (this.readerPool) {
         await this.readerPool.broadcast(readerPayload, true);
@@ -842,6 +860,8 @@ class Database extends EventEmitter {
    * @returns {Promise<this>} The Database instance.
    */
   async table(name, factory) {
+    this._ensureOpen();
+
     if (typeof name !== "string")
       throw new TypeError("Expected first argument to be a string");
     if (name.length === 0)
@@ -876,6 +896,11 @@ class Database extends EventEmitter {
         seen.add(col);
       }
 
+      // If it is present, it MUST be an array. undefined/null are not arrays.
+      if ("parameters" in factory && !Array.isArray(factory.parameters)) {
+        throw new TypeError("Expected parameters to be an array");
+      }
+
       if (factory.parameters !== undefined) {
         if (!Array.isArray(factory.parameters))
           throw new TypeError("Expected parameters to be an array");
@@ -904,9 +929,11 @@ class Database extends EventEmitter {
 
       // 2. Manual Serialization for Objects (Eponymous Wrapper)
       const cols = JSON.stringify(factory.columns);
-      const params = factory.parameters
-        ? JSON.stringify(factory.parameters)
-        : "undefined";
+      // CRITICAL FIX: Only include 'parameters' if it exists.
+      // better-sqlite3 throws if 'parameters' is present but undefined.
+      const paramsLine = factory.parameters
+        ? `parameters: ${JSON.stringify(factory.parameters)},`
+        : "";
       const rowsStr = factory.rows.toString().trim();
 
       // FIX: Correctly determine if rowsStr is a Method Definition or Function Expression
@@ -929,7 +956,7 @@ class Database extends EventEmitter {
 
       factoryString = `() => ({
          columns: ${cols},
-         parameters: ${params},
+         ${paramsLine}
          ${methodPart}
        })`;
 
@@ -991,6 +1018,12 @@ class Database extends EventEmitter {
     this._ensureOpen();
     if (typeof destinationFile !== "string") {
       throw new TypeError("Expected destinationFile to be a string");
+    }
+    if (!(await parentDirectoryExists(destinationFile))) {
+      throw new SqliteError(
+        "Parent directory does not exist",
+        "SQLITE_CANTOPEN",
+      );
     }
     // We explicitly check if the current async context is inside a transaction wrapper.
     if (this.inTransaction) {

@@ -411,6 +411,8 @@ try {
   throw err;
 }
 
+let walEnabled = false;
+
 try {
   // 2. Setup WAL Mode
   // - Only allowed for WRITERS (Readers are readonly and cannot change pragmas)
@@ -418,17 +420,16 @@ try {
   // - CRITICAL: Only enable if file ALREADY EXISTS.
   //   If it's new, we wait (stay in DELETE mode) to allow clean encryption setup.
   if (isWriter && !isMemory) {
-    if (initialFileExists) {
-      db.pragma("journal_mode = WAL");
-    } else {
-      // Log that we deferred WAL setup
-      if (verbose && parentPort) {
-        // parentPort.postMessage({
-        //   requestId: null,
-        //   status: "log",
-        //   data: `[Worker] Deferring WAL init for new DB: ${filename}`,
-        // });
-      }
+    db.pragma("journal_mode = WAL");
+    walEnabled = true;
+  } else {
+    // Log that we deferred WAL setup
+    if (verbose && parentPort) {
+      // parentPort.postMessage({
+      //   requestId: null,
+      //   status: "log",
+      //   data: `[Worker] Deferring WAL init for new DB: ${filename}`,
+      // });
     }
   }
 } catch (err) {
@@ -702,6 +703,21 @@ function handleMessage({ requestId, data }) {
 // =============================================================================
 
 /**
+ * Attempts to enable WAL mode if it hasn't been enabled yet.
+ * Used by Key/Rekey/Pragma handlers.
+ */
+function ensureWalMode() {
+  if (isWriter && !isMemory && !walEnabled) {
+    try {
+      db.pragma("journal_mode = WAL");
+      walEnabled = true;
+    } catch (e) {
+      // Ignore failures
+    }
+  }
+}
+
+/**
  * Handles 'run' requests (INSERT, UPDATE, DELETE).
  * @param {PayloadRun} payload
  * @returns {ResultRun}
@@ -752,8 +768,19 @@ function processExec(payload) {
  * @returns {ResultPragma}
  */
 function processPragma(payload) {
+  const isKeyRekey = /^(key|rekey)/i.test(payload.sql);
+  if (isKeyRekey && isWriter && !isMemory && walEnabled) {
+    try {
+      db.pragma("journal_mode = DELETE");
+      walEnabled = false;
+    } catch (e) {}
+  }
   // @ts-ignore - pragma options mapping
   const result = db.pragma(payload.sql, payload.options);
+  // Try enabling WAL only after key/rekey operations.
+  if (isKeyRekey) {
+    ensureWalMode();
+  }
   return { pragma: result };
 }
 
@@ -764,8 +791,17 @@ function processKey(payload) {
     key = Buffer.from(key);
   }
 
-  // @ts-ignore
+  // Explicitly reset WAL mode during rekey to ensure clean rewrite
+  if (isWriter && !isMemory && walEnabled) {
+    try {
+      db.pragma("journal_mode = DELETE");
+      walEnabled = false;
+    } catch (e) {}
+  }
+
   db.key(key);
+  // Key set -> Safe to enable WAL now
+  ensureWalMode();
 }
 
 /** @param {PayloadRekey} payload */
@@ -775,8 +811,16 @@ function processRekey(payload) {
     key = Buffer.from(key);
   }
 
-  // @ts-ignore
+  // Explicitly reset WAL mode during rekey to ensure clean rewrite
+  if (isWriter && !isMemory && walEnabled) {
+    try {
+      db.pragma("journal_mode = DELETE");
+      walEnabled = false;
+    } catch (e) {}
+  }
+
   db.rekey(key);
+  ensureWalMode();
 }
 
 /** @param {Payloadload_extension} payload */
@@ -795,7 +839,7 @@ function processDefaultSafeIntegers(payload) {
  */
 function processSerialize(payload) {
   const buffer = db.serialize(payload.options);
-  return { buffer };
+  return buffer;
 }
 
 /**

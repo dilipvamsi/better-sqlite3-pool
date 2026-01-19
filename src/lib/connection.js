@@ -15,6 +15,7 @@
  */
 
 const Statement = require("./statement");
+const { serializeAggregateOptions } = require("./utils");
 
 // =============================================================================
 // LEAK DETECTION REGISTRY
@@ -389,9 +390,14 @@ class Connection {
    * @param {string|Buffer} key
    */
   async rekey(key) {
+    if (!Buffer.isBuffer(key) && typeof key !== "string") {
+      throw new TypeError("Expected first argument to be a Buffer or String");
+    }
     // 1. Writer: Executes 'rekey' (rewrites database)
     if (this.writer) {
-      await this.writer.noLockExecute({ action: "rekey", key }, true);
+      await this.writer.noLockExecute({ action: "rekey", key });
+      // On the writer restart, we need key for the writer
+      await this.writer.noLockExecute({ action: "key", key }, true);
     }
 
     // 2. Readers: Execute 'key' (update internal handle to read new format)
@@ -446,6 +452,24 @@ class Connection {
     if (typeof callback !== "function")
       throw new TypeError("Expected second argument to be a function");
 
+    if (!opts.varargs) {
+      const len = callback.length;
+
+      // Check for non-integers or negative numbers
+      if (!Number.isInteger(len) || len < 0) {
+        throw new TypeError(
+          "Expected function.length to be a non-negative integer",
+        );
+      }
+
+      // Check SQLite limit (max 100 arguments for UDFs)
+      if (len > 100) {
+        throw new RangeError(
+          "User-defined functions cannot have more than 100 arguments",
+        );
+      }
+    }
+
     const fnString = fn.toString();
     // Note: We don't push to db._initFunctions here because Connection is ephemeral.
     // If you want permanent functions, register them on the DB instance, not the Connection.
@@ -477,23 +501,6 @@ class Connection {
     if (!options.step)
       throw new TypeError("Expected options.step to be a function");
 
-    // Helper to serialize (reused from DB logic usually, but duplicated here for isolation)
-    // Note: If you have a shared util for serializeAggregateOptions, import it.
-    // Assuming standard implementation:
-    const serializeAggregateOptions = (opts) => {
-      const out = { ...opts };
-      if (typeof opts.step === "function") out.step = opts.step.toString();
-      if (typeof opts.inverse === "function")
-        out.inverse = opts.inverse.toString();
-      if (typeof opts.result === "function")
-        out.result = opts.result.toString();
-      if (typeof opts.start === "function") {
-        out.start = opts.start.toString();
-        out._startIsFunc = true;
-      }
-      return out;
-    };
-
     // Prepare payload
     const payload = {
       action: "aggregate",
@@ -510,9 +517,15 @@ class Connection {
    * @returns {Promise<Buffer>}
    */
   async serialize(options) {
+    this._ensureActive();
     // Always use the writer to get the most up-to-date state
-    const result = await this._requestWrite("serialize", { options });
-    return result.buffer; // The worker returns { buffer: Buffer }
+    let result;
+    if (this.readonly) {
+      result = await this._requestRead("serialize", { options });
+    } else {
+      result = await this._requestWrite("serialize", { options });
+    }
+    return Buffer.from(result); // The worker returns the Buffer
   }
 
   /**
@@ -558,12 +571,15 @@ class Connection {
 
     // SPECIAL HANDLING FOR 'REKEY' PRAGMA
     if (/^rekey\s*=/i.test(trimmedSql)) {
-      // 1. Writer: Execute as-is (Perform rewrite)
-      const writerRes = await this.writer.noLockExecute(payload, true);
-
-      // 2. Readers: Convert 'rekey' to 'key'
+      // 1. Readers: Convert 'rekey' to 'key'
       const readerSql = trimmedSql.replace(/^rekey/i, "key");
       const readerPayload = { action: "pragma", sql: readerSql, options };
+
+      // 2. Writer: Execute as-is (Perform rewrite)
+      const writerRes = await this.writer.noLockExecute(payload);
+
+      // On the writer restart, we need key for the writer
+      await this.writer.noLockExecute(readerPayload, true);
 
       if (this.readerPool) {
         await this.readerPool.broadcast(readerPayload, true);
@@ -603,8 +619,114 @@ class Connection {
    * @returns {Promise<this>} The Database instance.
    */
   async table(name, factory) {
-    const factoryString = factory.toString();
-    const payload = { action: "table", name, factoryString };
+    this._ensureActive();
+
+    if (typeof name !== "string")
+      throw new TypeError("Expected first argument to be a string");
+    if (name.length === 0)
+      throw new TypeError("Expected table name to be a non-empty string");
+    if (
+      typeof factory !== "function" &&
+      (typeof factory !== "object" || factory === null)
+    ) {
+      throw new TypeError(
+        "Expected second argument to be a function or a module object",
+      );
+    }
+
+    let factoryString;
+    let isEponymous = false;
+
+    if (typeof factory === "object") {
+      // 1. Synchronous Validation (Mimic native better-sqlite3 strictness)
+      if (!Array.isArray(factory.columns)) {
+        if (factory.columns === undefined)
+          throw new TypeError("Expected columns to be an array");
+        throw new TypeError("Expected columns to be an array");
+      }
+      if (factory.columns.length === 0)
+        throw new RangeError("Expected columns to be a non-empty array");
+
+      const seen = new Set();
+      for (const col of factory.columns) {
+        if (typeof col !== "string")
+          throw new TypeError("Expected column names to be strings");
+        if (seen.has(col)) throw new TypeError("Duplicate column name");
+        seen.add(col);
+      }
+
+      // If it is present, it MUST be an array. undefined/null are not arrays.
+      if ("parameters" in factory && !Array.isArray(factory.parameters)) {
+        throw new TypeError("Expected parameters to be an array");
+      }
+
+      if (factory.parameters !== undefined) {
+        if (!Array.isArray(factory.parameters))
+          throw new TypeError("Expected parameters to be an array");
+        if (factory.parameters.length > 32)
+          throw new RangeError("Too many parameters");
+        const seenParams = new Set();
+        for (const param of factory.parameters) {
+          if (typeof param !== "string")
+            throw new TypeError("Expected parameter names to be strings");
+          if (seenParams.has(param))
+            throw new TypeError("Duplicate parameter name");
+          seenParams.add(param);
+        }
+      }
+
+      if (typeof factory.rows !== "function")
+        throw new TypeError("Expected rows to be a generator function");
+
+      const len = factory.rows.length;
+      if (!Number.isInteger(len) || len < 0)
+        throw new TypeError(
+          "Expected function.length to be a non-negative integer",
+        );
+      if (len > 32)
+        throw new RangeError("Virtual table module has too many parameters");
+
+      // 2. Manual Serialization for Objects (Eponymous Wrapper)
+      const cols = JSON.stringify(factory.columns);
+      // CRITICAL FIX: Only include 'parameters' if it exists.
+      // better-sqlite3 throws if 'parameters' is present but undefined.
+      const paramsLine = factory.parameters
+        ? `parameters: ${JSON.stringify(factory.parameters)},`
+        : "";
+      const rowsStr = factory.rows.toString().trim();
+
+      // FIX: Correctly determine if rowsStr is a Method Definition or Function Expression
+      let methodPart;
+
+      // If it starts with 'function', '(', 'async function', or 'async (', it needs a key "rows:"
+      // If it starts with 'rows', '*rows', 'async rows', it INCLUDES the key (Method Shorthand).
+      if (
+        rowsStr.startsWith("function") ||
+        rowsStr.startsWith("(") ||
+        rowsStr.startsWith("async function") ||
+        rowsStr.startsWith("async (")
+      ) {
+        methodPart = `rows: ${rowsStr}`;
+      } else {
+        // Assume Method Shorthand (e.g. "*rows() {}", "rows() {}")
+        // This must be pasted AS IS into the object literal.
+        methodPart = rowsStr;
+      }
+
+      factoryString = `() => ({
+         columns: ${cols},
+         ${paramsLine}
+         ${methodPart}
+       })`;
+
+      isEponymous = true;
+    } else {
+      // Function (Module)
+      factoryString = factory.toString();
+      isEponymous = false;
+    }
+
+    const payload = { action: "table", name, factoryString, isEponymous };
     await this._execConfig(payload);
     return this;
   }

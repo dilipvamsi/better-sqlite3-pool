@@ -84,6 +84,7 @@ describe("verbose mode", function () {
 
     expect(calls).to.deep.equal([
       [db, "PRAGMA journal_mode = WAL"], // this called as we are running starting the writer worker with PRAGMA
+      [db, "PRAGMA journal_mode = WAL"],
       [db, "select 5"],
       [db, "create table data (x)"],
       [db, "select 10"],

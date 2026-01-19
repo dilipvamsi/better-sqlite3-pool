@@ -46,9 +46,10 @@ describe("Database#key()", function () {
     this.db = await Database.create(util.next());
 
     // Set cipher configuration via Pragma
-    const { pragma } = await this.db.pragma(`cipher='aes256cbc'`);
+    await this.db.pragma(`cipher='aes256cbc'`);
 
     // Set Key
+    await this.db.rekey(Buffer.from("OkPassword"));
     await this.db.key(Buffer.from("OkPassword"));
 
     // Verify by writing to it (if key failed, this might throw or fail silently depending on implementation)
