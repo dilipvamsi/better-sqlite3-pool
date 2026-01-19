@@ -4,7 +4,18 @@
  */
 const fs = require("fs/promises");
 const path = require("path");
-const { SqliteError } = require("better-sqlite3-multiple-ciphers");
+const betterSqlite3 = require("better-sqlite3-multiple-ciphers");
+
+/**
+ * SqliteError which contains the optional test data as well.
+ */
+class SqliteError extends betterSqlite3.SqliteError {
+  constructor(message, code, __data = undefined) {
+    super(message, code);
+    this.__data = __data;
+    Object.setPrototypeOf(this, SqliteError.prototype);
+  }
+}
 
 // SQL types that must ALWAYS remain BigInt in JS to preserve precision.
 const BIGINT_TYPES = new Set(["BIGINT", "INT64", "UNSIGNED BIG INT"]);
@@ -51,32 +62,50 @@ function castRow(row, columns) {
 /**
  * Reconstructs a genuine SqliteError or Error from the worker payload.
  * @param {Object} errPayload - { message, code }
+ * @param {any} data - Additional data to include in the error.
  * @returns {Error}
  */
-function createErrorByType(error) {
+function createErrorByType(error, data = undefined) {
+  let err;
   // console.log(error);
   switch (error.name) {
     case "TypeError":
-      return new TypeError(error.message);
+      err = new TypeError(error.message);
+      break;
     case "RangeError":
-      return new RangeError(error.message);
+      err = new RangeError(error.message);
+      break;
     case "ReferenceError":
-      return new ReferenceError(error.message);
+      err = new ReferenceError(error.message);
+      break;
     case "SyntaxError":
-      return new SyntaxError(error.message);
+      err = new SyntaxError(error.message);
+      break;
     case "URIError":
-      return new URIError(error.message);
+      err = new URIError(error.message);
+      break;
+    case "URIError":
+      err = new URIError(error.message);
+      break;
     case "EvalError":
-      return new EvalError(error.message);
+      err = new EvalError(error.message);
+      break;
     case "AggregateError":
-      return new AggregateError(error.message);
+      err = new AggregateError(error.message);
+      break;
     case "Error":
-      return new Error(error.message);
+      err = new Error(error.message);
+      break;
     case "SqliteError":
-      return new SqliteError(error.message, error.code);
+      err = new SqliteError(error.message, error.code, data);
+      break;
     default:
-      return new Error(error.message);
+      err = new Error(error.message);
   }
+  if (data && error.name !== "SqliteError") {
+    err.__data = data;
+  }
+  return err;
 }
 
 /**
@@ -132,6 +161,11 @@ const serializeAggregateOptions = (opts) => {
   if (typeof opts.step === "function") out.step = opts.step.toString();
   if (typeof opts.inverse === "function") out.inverse = opts.inverse.toString();
   if (typeof opts.result === "function") out.result = opts.result.toString();
+  // Handle 'start' which can be a value OR a function
+  if (typeof opts.start === "function") {
+    out.start = opts.start.toString();
+    out._startIsFunc = true; // internal flag to signal the worker
+  }
   return out;
 };
 
@@ -141,4 +175,5 @@ module.exports = {
   fileExists,
   parentDirectoryExists,
   serializeAggregateOptions,
+  SqliteError,
 };

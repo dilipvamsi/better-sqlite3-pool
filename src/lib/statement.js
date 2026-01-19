@@ -102,8 +102,10 @@ class Statement {
    * Create a new Statement proxy.
    * @param {Database | Connection} dbOrConn - The parent Database instance or Connection instance.
    * @param {string} sql - The raw SQL string.
+   * @param {object} options - Additional options for the statement.
+   * @param {boolean} [options.readonly] - Force route to Reader (true) or Writer (false)
    */
-  constructor(dbOrConn, sql) {
+  constructor(dbOrConn, sql, options = {}) {
     // Validation to satisfy "expect(() => new stmt.constructor(source)).to.throw(TypeError);"
     // We check if 'db' looks like our Database object (has 'prepare' method)
     const type = dbOrConn ? dbOrConn.constructor.name : "Unknown";
@@ -125,25 +127,28 @@ class Statement {
     /** @type {string} The SQL source string. */
     this.source = sql;
 
-    /**
-     * @type {boolean}
-     * Indicates if the statement is "Read-Only" safe.
-     *
-     * Used for **Connection Routing**:
-     * - `true`: Can be safely executed on a load-balanced Reader worker (or the Writer).
-     * - `false`: Must be executed on the Writer (modifies data or acquires write locks).
-     *
-     * Logic:
-     * 1. EXCLUDE `BEGIN IMMEDIATE/EXCLUSIVE`: These explicitly acquire write locks.
-     * 2. INCLUDE `SELECT`, `EXPLAIN`, `VALUES`, and Transaction controls (`BEGIN`, `COMMIT`, etc).
-     * 3. EXCLUDE `RETURNING`: Write operations (INSERT/UPDATE) that return data are NOT read-only.
-     */
-    this.readonly =
+    // --- 1. Calculate Default Read-Only Heuristic ---
+    // Standard SQL analysis to guess if it's safe for readers.
+    const heuristicReadonly =
       !/^\s*BEGIN\s+(IMMEDIATE|EXCLUSIVE)/i.test(this.source) &&
       /^\s*(SELECT|EXPLAIN|VALUES|BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE)/i.test(
         this.source,
       ) &&
       !/RETURNING\b/i.test(this.source);
+
+    // --- 2. Apply Routing Logic ---
+    // If the user provided an explicit override (options.readonly), USE IT.
+    // Otherwise, fallback to the regex heuristic.
+    //
+    // This allows support for custom extensions that might "look like" reads (SELECT func())
+    // but actually perform writes and thus need to be routed to the Writer worker.
+    /**
+     * @type {boolean}
+     * Indicates if the statement is "Read-Only" safe.
+     * Used for **Connection Routing**.
+     */
+    this.readonly =
+      options.readonly !== undefined ? !!options.readonly : heuristicReadonly;
 
     /**
      * @type {boolean}
@@ -391,10 +396,12 @@ class Statement {
       }
       // 1. Transaction: Must use Writer (Reader workers don't see uncommitted data).
       // 2. Write Query: Queries with RETURNING (INSERT..RETURNING) must go to Writer.
-      // 3. Memory DB: Only Writer exists (Readers are disabled).
+      // 3. Manual Override: if this.readonly is FALSE (set manually or by regex), go to Writer.
+      // 4. Memory DB: Only Writer exists (Readers are disabled).
       else if (this.db.inTransaction || !this.readonly || this.db.memory) {
         result = await this.db._requestWrite("all", payload);
       } else {
+        // Safe to read
         result = await this.db._requestRead("all", payload);
       }
     }
@@ -504,14 +511,14 @@ class Statement {
       workerClient = this.ctx.writer;
       // Do NOT call lock(), it is already locked by the Connection.
     } else if (this.db.inTransaction || (!this.db.readonly && !this.readonly)) {
-      // DB-level transaction wrapper active OR Write query
+      // DB-level transaction wrapper active OR Write query (via Regex or Manual Override)
       if (!this.db.writer) {
         throw new SqliteError("No writer available", "SQLITE_MISUSE");
       }
       workerClient = this.db.writer;
-      // We shouldn't need to lock if inTransaction (wrapper handles it),
-      // but if it's just a write query iterate(), we might need to lock.
-      // Actually, iterate() on a write query is rare/weird, usually implies RETURNING.
+
+      // If we are not inside a managed transaction context, we must lock manually
+      // to safely stream from the writer.
       if (!this.db.inTransaction) {
         await workerClient.lock();
         manualLock = true;
@@ -544,7 +551,8 @@ class Statement {
         });
       } catch (err) {
         // Even though error is raised valid rows are returned before the error
-        result = err.__data;
+        // Safety check: if __data is undefined, ensure result is an object to prevent TypeError
+        result = err.__data || {};
         error = err;
       }
       // Capture columns from first batch
@@ -579,10 +587,11 @@ class Statement {
             action: "iterator_next",
             iteratorId,
           });
-        } catch (error) {
+        } catch (e) {
+          // FIX: Use correctly named variable 'e'
           // Even though error is raised valid rows are returned before the error
-          result = err.__data;
-          error = err;
+          result = e.__data || {};
+          error = e;
         }
         // console.log(result);
         if (result.rows && result.rows.length > 0) {

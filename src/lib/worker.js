@@ -7,6 +7,8 @@
  */
 
 const { parentPort, workerData } = require("node:worker_threads");
+const crypto = require("node:crypto");
+const fs = require("fs");
 const Database = require("better-sqlite3-multiple-ciphers");
 const { SqliteError } = require("better-sqlite3-multiple-ciphers");
 
@@ -19,7 +21,8 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
  * @property {'read' | 'write'} mode - The operation mode.
  * @property {string} filename - Path to the SQLite database file.
  * @property {boolean} [fileMustExist] - If true, throws if the database file does not exist.
- * @property {number} [timeout] - The number of milliseconds to wait when locking the database.
+ * @property {number} [timeout] - The busy timeout (ms).
+ * @property {number} [transactionTimeout] - Max duration (ms) for an idle transaction before auto-rollback.
  * @property {string} [nativeBinding] - Path to the native addon executable.
  * @property {boolean} [verbose] - If true, logs are sent.
  */
@@ -320,16 +323,30 @@ const { SqliteError } = require("better-sqlite3-multiple-ciphers");
  */
 
 // =============================================================================
+// GLOBAL STATE
+// =============================================================================
+
+/**
+ * Tracks the ID of the request currently being processed.
+ * Used to correlate verbose log messages with specific requests.
+ * @type {string|null}
+ */
+let currentRequestId = null;
+
+// =============================================================================
 // 5. INITIALIZATION
 // =============================================================================
 
 /** @type {WorkerData} */
-const { filename, fileMustExist, timeout, nativeBinding, mode, verbose } =
-  workerData;
-
-// console.log(`[Worker:${mode}] Starting... DB: ${filename}`);
-
-// console.log(`${mode}: `, workerData);
+const {
+  filename,
+  fileMustExist,
+  timeout,
+  transactionTimeout,
+  nativeBinding,
+  mode,
+  verbose,
+} = workerData;
 
 const isWriter = mode === "write";
 const isMemory = filename === ":memory:" || filename === "";
@@ -361,6 +378,25 @@ if (nativeBinding) options.nativeBinding = nativeBinding;
 // Default timeout prevents immediate failures if DB is locked by another process
 options.timeout = timeout !== undefined ? timeout : 5000;
 
+// Determine transaction heartbeat timeout.
+// Use specific transactionTimeout if provided, else fallback to timeout, else 30s.
+const TX_TIMEOUT_MS =
+  transactionTimeout !== undefined
+    ? transactionTimeout
+    : timeout !== undefined
+      ? timeout
+      : 30000;
+
+// Check existence BEFORE opening to decide on WAL initialization
+let initialFileExists = false;
+if (!isMemory) {
+  try {
+    initialFileExists = fs.existsSync(filename);
+  } catch (e) {
+    /* ignore */
+  }
+}
+
 try {
   db = new Database(filename, options);
 } catch (err) {
@@ -379,15 +415,30 @@ try {
   // 2. Setup WAL Mode
   // - Only allowed for WRITERS (Readers are readonly and cannot change pragmas)
   // - Only allowed for FILE-BASED databases (Memory DBs don't use WAL files)
+  // - CRITICAL: Only enable if file ALREADY EXISTS.
+  //   If it's new, we wait (stay in DELETE mode) to allow clean encryption setup.
   if (isWriter && !isMemory) {
-    db.pragma("journal_mode = WAL");
+    if (initialFileExists) {
+      db.pragma("journal_mode = WAL");
+    } else {
+      // Log that we deferred WAL setup
+      if (verbose && parentPort) {
+        // parentPort.postMessage({
+        //   requestId: null,
+        //   status: "log",
+        //   data: `[Worker] Deferring WAL init for new DB: ${filename}`,
+        // });
+      }
+    }
   }
 } catch (err) {
-  if (parentPort) {
-    parentPort.postMessage({
-      status: "setup_error",
-      error: formatError(err),
-    });
+  // SOFT FAIL: If setting WAL fails (e.g. Encrypted DB locked), we log it but do NOT crash.
+  if (parentPort && verbose) {
+    // parentPort.postMessage({
+    //   requestId: null,
+    //   status: "log",
+    //   data: `[Worker Warning] Failed to set WAL mode: ${err.message}`,
+    // });
   }
 }
 
@@ -406,6 +457,12 @@ if (parentPort) {
 /** @type {Map<string, Iterator<any>>} Stores active iterators for streaming. */
 const activeStreams = new Map();
 
+/** @type {NodeJS.Timeout|null} Timer for checking transaction duration. */
+let transactionTimer = null;
+
+/** @type {string|null} Tracks the unique ID of the current transaction session. */
+let currentTransactionId = null;
+
 // =============================================================================
 // 6. CENTRAL DISPATCHER
 // =============================================================================
@@ -416,9 +473,23 @@ if (parentPort) {
 
 function send(response) {
   if (parentPort) {
+    // Check if we need to refresh or clear the transaction timer
+    checkTransactionHeartbeat();
+
     // Capture the ACTUAL physical transaction state from SQLite
     if (db && typeof db.inTransaction === "boolean") {
       response.inTransaction = db.inTransaction;
+
+      if (db.inTransaction) {
+        // If we just entered a transaction or are in one, ensure we have an ID
+        if (!currentTransactionId) {
+          currentTransactionId = crypto.randomUUID();
+        }
+        response.transactionId = currentTransactionId;
+      } else {
+        // Not in transaction, clear global ID
+        currentTransactionId = null;
+      }
     }
     parentPort.postMessage(response);
   }
@@ -430,6 +501,8 @@ function send(response) {
  */
 function handleMessage({ requestId, data }) {
   if (!data) return;
+
+  currentRequestId = requestId;
 
   try {
     switch (data.action) {
@@ -599,6 +672,9 @@ function handleMessage({ requestId, data }) {
         throwSqliteError(`Unknown action: ${data.action}`, "SQLITE_MISUSE");
     }
   } catch (err) {
+    // Check heartbeat even on error (transaction might still be open)
+    checkTransactionHeartbeat();
+
     /** @type {ResponseError} */
     const res = {
       requestId,
@@ -606,9 +682,18 @@ function handleMessage({ requestId, data }) {
       status: "error",
       error: formatError(err),
     };
+
+    // If still in transaction after error, include the ID
+    if (db && db.inTransaction) {
+      res.inTransaction = true;
+      res.transactionId = currentTransactionId;
+    }
+
     // console.log(data);
     // console.log(err);
-    send(res);
+    if (parentPort) parentPort.postMessage(res);
+  } finally {
+    currentRequestId = null;
   }
 }
 
@@ -674,14 +759,24 @@ function processPragma(payload) {
 
 /** @param {PayloadKey} payload */
 function processKey(payload) {
+  let key = payload.key;
+  if (key instanceof Uint8Array && !Buffer.isBuffer(key)) {
+    key = Buffer.from(key);
+  }
+
   // @ts-ignore
-  db.key(payload.key);
+  db.key(key);
 }
 
 /** @param {PayloadRekey} payload */
 function processRekey(payload) {
+  let key = payload.key;
+  if (key instanceof Uint8Array && !Buffer.isBuffer(key)) {
+    key = Buffer.from(key);
+  }
+
   // @ts-ignore
-  db.rekey(payload.key);
+  db.rekey(key);
 }
 
 /** @param {Payloadload_extension} payload */
@@ -753,9 +848,14 @@ async function processBackup(requestId, payload) {
 /** @param {PayloadTable} payload */
 function processTable(payload) {
   const factory = deserializeFunction(payload.factoryString);
-  // Execute factory to get table options
-  const tableOpts = factory();
-  db.table(payload.name, tableOpts);
+
+  if (payload.isEponymous) {
+    // Eponymous: Execute wrapper to get object, register as table
+    db.table(payload.name, factory());
+  } else {
+    // Module: Register function as module
+    db.table(payload.name, factory);
+  }
 }
 
 /** @param {PayloadUnsafeMode} payload */
@@ -826,6 +926,10 @@ function processAggregate(payload) {
  * Handles cleanup.
  */
 function processClose() {
+  if (transactionTimer) {
+    clearTimeout(transactionTimer);
+    transactionTimer = null;
+  }
   cleanupStreams();
   if (db && db.open) {
     db.close();
@@ -835,6 +939,65 @@ function processClose() {
 // =============================================================================
 // 8. UTILITY FUNCTIONS
 // =============================================================================
+
+/**
+ * Manages the heartbeat timer for active transactions.
+ * Should be called after every database operation.
+ */
+function checkTransactionHeartbeat() {
+  // Clear any existing timer first
+  if (transactionTimer) {
+    clearTimeout(transactionTimer);
+    transactionTimer = null;
+  }
+
+  // If we are actively in a transaction, start the auto-rollback timer
+  if (db && db.inTransaction && db.open) {
+    transactionTimer = setTimeout(forceRollback, TX_TIMEOUT_MS);
+  }
+}
+
+/**
+ * Triggered when a transaction exceeds the allowed duration.
+ */
+function forceRollback() {
+  if (db && db.inTransaction && db.open) {
+    // Capture the ID of the transaction we are about to kill
+    const rolledBackId = currentTransactionId;
+
+    try {
+      // Force rollback
+      db.exec("ROLLBACK");
+
+      // Rollback successful, clear global state
+      currentTransactionId = null;
+
+      // Notify parent
+      if (parentPort) {
+        parentPort.postMessage({
+          requestId: null, // System event, not a response to specific request
+          status: "transaction_close",
+          transactionId: rolledBackId, // Return the ID so parent knows which TX ended
+          error: {
+            message: `Transaction forcibly closed after exceeding ${TX_TIMEOUT_MS}ms`,
+            code: "TRANSACTION_TIMEOUT",
+            name: "SqliteError",
+          },
+        });
+      }
+    } catch (err) {
+      // If rollback fails (e.g. DB closed or fatal error), notify parent of failure
+      if (parentPort) {
+        parentPort.postMessage({
+          requestId: null,
+          status: "error",
+          error: formatError(err),
+        });
+      }
+    }
+  }
+  transactionTimer = null;
+}
 
 /**
  * Prepares a statement with options.
@@ -848,6 +1011,9 @@ function prepareStatement(sql, options) {
     if (options.pluck) stmt.pluck(true);
     if (options.raw) stmt.raw(true);
     if (options.expand) stmt.expand(true);
+    if (options.safeIntegers !== undefined) {
+      stmt.safeIntegers(options.safeIntegers);
+    }
   }
   return stmt;
 }
@@ -921,6 +1087,12 @@ function deserializeAggregateOptions(opts) {
   if (opts.step) out.step = deserializeFunction(opts.step);
   if (opts.inverse) out.inverse = deserializeFunction(opts.inverse);
   if (opts.result) out.result = deserializeFunction(opts.result);
+
+  // Deserialize 'start' only if it was flagged as a function
+  if (opts._startIsFunc && typeof opts.start === "string") {
+    out.start = deserializeFunction(opts.start);
+    delete out._startIsFunc; // clean up internal flag
+  }
   return out;
 }
 

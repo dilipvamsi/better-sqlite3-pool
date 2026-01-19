@@ -9,8 +9,9 @@
  *
  * SAFETY MECHANISMS:
  * 1. Hard Timeout (Max Life): Limits total duration of a transaction.
- * 2. Idle Timeout (Heartbeat): limits time between commands.
- * 3. Leak Detection (GC): Emergency unlock if object goes out of scope.
+ * 2. Idle Timeout (Heartbeat): Limits time between commands (Client-side).
+ * 3. Worker Heartbeat Sync: Reacts if the Worker kills the transaction.
+ * 4. Leak Detection (GC): Emergency unlock if object goes out of scope.
  */
 
 const Statement = require("./statement");
@@ -23,7 +24,7 @@ const Statement = require("./statement");
  * Monitors Connection objects. If a Connection is Garbage Collected before
  * .release() is called, this callback fires to force-unlock the Writer.
  */
-const leakRegistry = new FinalizationRegistry(({ writer, stack }) => {
+const leakRegistry = new FinalizationRegistry(({ writer, stack, listener }) => {
   console.error(
     `\n[better-sqlite3-pool] CRITICAL LEAK DETECTED!
     A write connection was acquired but never released.
@@ -34,6 +35,11 @@ const leakRegistry = new FinalizationRegistry(({ writer, stack }) => {
     Origin of leak:
     ${stack}\n`,
   );
+
+  // 0. Cleanup Listeners
+  if (listener) {
+    writer.off("transaction_timeout", listener);
+  }
 
   // 1. Emergency Rollback (Fire and Forget)
   // We attempt to clean up the SQLite transaction state.
@@ -73,8 +79,7 @@ class Connection {
    * This is the ONLY public way to get a connection.
    *
    * @param {import('./database').Database} db
-   * @param {import('./database').Database} db - The parent database instance.
-   * @param {number} [maxLife=60000] - Hard limit (ms) for the session duration.
+   * @param {number} [maxLife=20000] - Hard limit (ms) for the session duration.
    * @param {number} [idleTimeout=5000] - Limit (ms) for inactivity between queries.
    */
   static async create(db, maxLife, idleTimeout) {
@@ -93,10 +98,10 @@ class Connection {
    *
    * @param {Symbol} token - Internal token to prevent public constructor usage.
    * @param {import('./database').Database} db - The parent database instance.
-   * @param {number} [maxLife=60000] - Hard limit (ms) for the session duration.
+   * @param {number} [maxLife=20000] - Hard limit (ms) for the session duration.
    * @param {number} [idleTimeout=5000] - Limit (ms) for inactivity between queries.
    */
-  constructor(token, db, maxLife = 60000, idleTimeout = 5000) {
+  constructor(token, db, maxLife = 20000, idleTimeout = 5000) {
     if (token !== kConnectionInternal) {
       throw new Error("Use 'await db.acquire()' to create a connection.");
     }
@@ -113,7 +118,13 @@ class Connection {
     // Configuration
     this.idleLimit = idleTimeout;
 
-    // --- 1. HARD LIMIT (Max Transaction Time) ---
+    // --- 1. WORKER EVENT SYNC ---
+    // If the Worker kills the transaction (due to its own internal heartbeat),
+    // we must immediately unlock the mutex locally.
+    this._onWorkerTimeout = this._handleWorkerTimeout.bind(this);
+    this.writer.on("transaction_timeout", this._onWorkerTimeout);
+
+    // --- 2. HARD LIMIT (Max Transaction Time) ---
     // Kills the transaction if it takes too long overall (e.g. infinite loop).
     this._lifeTimer = setTimeout(() => {
       this._forceRelease("Connection max life exceeded");
@@ -121,12 +132,12 @@ class Connection {
     // Unref ensures this timer doesn't prevent Node from exiting
     if (this._lifeTimer.unref) this._lifeTimer.unref();
 
-    // --- 2. IDLE LIMIT (Heartbeat) ---
+    // --- 3. IDLE LIMIT (Client Heartbeat) ---
     // Kills the transaction if the user stops sending commands (e.g. forgot release).
     this._idleTimer = null;
     this._resetIdleTimer();
 
-    // --- 3. LEAK DETECTION ---
+    // --- 4. LEAK DETECTION ---
     // Register this instance. If it gets GC'd, we know we leaked.
     // We store the creation stack trace to help the user debug.
     leakRegistry.register(
@@ -134,6 +145,7 @@ class Connection {
       {
         writer: this.writer,
         stack: new Error().stack,
+        listener: this._onWorkerTimeout,
       },
       this,
     );
@@ -186,12 +198,14 @@ class Connection {
   /**
    * Creates a prepared statement bound to this specific connection.
    * @param {string} sql - The SQL query.
+   * @param {object} options - Additional options for the statement.
+   * @param {boolean} [options.readonly] - Force route to Reader (true) or Writer (false)
    * @returns {Statement} A statement instance bound to this connection context.
    */
-  prepare(sql) {
+  prepare(sql, options) {
     this._ensureActive();
     // We pass 'this' (the Connection) as the context instead of the Database
-    return new Statement(this, sql);
+    return new Statement(this, sql, options);
   }
 
   /**
@@ -263,7 +277,31 @@ class Connection {
   }
 
   /**
-   * Emergency release method called by timers.
+   * Handler for when the Worker thread forcibly closes the transaction.
+   * @param {Error} error
+   * @private
+   */
+  _handleWorkerTimeout(error) {
+    if (this._released) return;
+
+    // Unregister leak detection
+    leakRegistry.unregister(this);
+
+    console.warn(
+      `[better-sqlite3-pool] Worker forcibly closed transaction: ${error.message}`,
+    );
+
+    // 1. Cleanup Timers & Listeners
+    // We do NOT send ROLLBACK, because the worker already did it.
+    this._cleanup();
+
+    // 2. Unlock Node.js Mutex
+    // This allows the next waiting request to use the worker
+    this.writer.unlock();
+  }
+
+  /**
+   * Emergency release method called by CLIENT-SIDE timers.
    * Logs a warning, attempts rollback, and unlocks.
    * @param {string} reason - The cause of the forced release.
    * @private
@@ -288,11 +326,17 @@ class Connection {
   }
 
   /**
-   * Cleans up internal state and timers.
+   * Cleans up internal state, timers, and event listeners.
    * @private
    */
   _cleanup() {
     this._released = true;
+
+    // Stop listening to the worker
+    if (this.writer && this._onWorkerTimeout) {
+      this.writer.off("transaction_timeout", this._onWorkerTimeout);
+    }
+
     if (this._lifeTimer) {
       clearTimeout(this._lifeTimer);
       this._lifeTimer = null;
@@ -302,6 +346,7 @@ class Connection {
       this._idleTimer = null;
     }
   }
+
   // ===========================================================================
   // CONFIGURATION & PLUGINS
   // ===========================================================================
@@ -332,6 +377,9 @@ class Connection {
    * @param {string|Buffer} key
    */
   async key(key) {
+    if (!Buffer.isBuffer(key) && typeof key !== "string") {
+      throw new TypeError("Expected first argument to be a Buffer or String");
+    }
     const payload = { action: "key", key };
     await this._execConfig(payload);
   }
@@ -341,8 +389,16 @@ class Connection {
    * @param {string|Buffer} key
    */
   async rekey(key) {
-    const payload = { action: "rekey", key };
-    await this._execConfig(payload);
+    // 1. Writer: Executes 'rekey' (rewrites database)
+    if (this.writer) {
+      await this.writer.noLockExecute({ action: "rekey", key }, true);
+    }
+
+    // 2. Readers: Execute 'key' (update internal handle to read new format)
+    // Readers cannot 'rekey' (write), so we just give them the new key.
+    if (this.readerPool) {
+      await this.readerPool.broadcast({ action: "key", key }, true);
+    }
   }
 
   /**
@@ -391,7 +447,9 @@ class Connection {
       throw new TypeError("Expected second argument to be a function");
 
     const fnString = fn.toString();
-    this._initFunctions.push({ name, fnString });
+    // Note: We don't push to db._initFunctions here because Connection is ephemeral.
+    // If you want permanent functions, register them on the DB instance, not the Connection.
+
     const payload = {
       action: "function",
       fnName: name,
@@ -419,6 +477,23 @@ class Connection {
     if (!options.step)
       throw new TypeError("Expected options.step to be a function");
 
+    // Helper to serialize (reused from DB logic usually, but duplicated here for isolation)
+    // Note: If you have a shared util for serializeAggregateOptions, import it.
+    // Assuming standard implementation:
+    const serializeAggregateOptions = (opts) => {
+      const out = { ...opts };
+      if (typeof opts.step === "function") out.step = opts.step.toString();
+      if (typeof opts.inverse === "function")
+        out.inverse = opts.inverse.toString();
+      if (typeof opts.result === "function")
+        out.result = opts.result.toString();
+      if (typeof opts.start === "function") {
+        out.start = opts.start.toString();
+        out._startIsFunc = true;
+      }
+      return out;
+    };
+
     // Prepare payload
     const payload = {
       action: "aggregate",
@@ -435,10 +510,9 @@ class Connection {
    * @returns {Promise<Buffer>}
    */
   async serialize(options) {
-    this._ensureOpen();
     // Always use the writer to get the most up-to-date state
     const result = await this._requestWrite("serialize", { options });
-    return result; // The worker returns the Buffer
+    return result.buffer; // The worker returns { buffer: Buffer }
   }
 
   /**
@@ -451,7 +525,7 @@ class Connection {
    * @returns {Promise<void>} The result of the PRAGMA execution.
    */
   async pragma(sql, options = {}) {
-    this._ensureOpen();
+    this._ensureActive(); // Use ensureActive for Connection context
 
     if (!sql) {
       throw new TypeError("SQL statement is required");
@@ -472,23 +546,49 @@ class Connection {
     const payload = { action: "pragma", sql, options };
 
     // READONLY MODE
-    if (this.readonly) {
-      if (this.readerPool) {
+    if (this.db.readonly) {
+      // In readonly mode, we can only affect readers (e.g. cache_size)
+      if (this.db.readerPool) {
         // Sticky broadcast ensuring new readers get this pragma
         const results = await this.db.readerPool.broadcast(payload, true);
-        // Return the result from the first worker (they should all be identical)
-        return results[0].pragma;
+        return results[0]?.pragma;
       }
       return;
+    }
+
+    // SPECIAL HANDLING FOR 'REKEY' PRAGMA
+    if (/^rekey\s*=/i.test(trimmedSql)) {
+      // 1. Writer: Execute as-is (Perform rewrite)
+      const writerRes = await this.writer.noLockExecute(payload, true);
+
+      // 2. Readers: Convert 'rekey' to 'key'
+      const readerSql = trimmedSql.replace(/^rekey/i, "key");
+      const readerPayload = { action: "pragma", sql: readerSql, options };
+
+      if (this.readerPool) {
+        await this.readerPool.broadcast(readerPayload, true);
+      }
+
+      return writerRes.pragma;
+    }
+
+    // SPECIAL HANDLING FOR 'JOURNAL_MODE' PRAGMA
+    // ONLY Execute on Writer. DO NOT Broadcast.
+    // Readers automatically pick up the mode from the file header.
+    // Broadcasting causes errors (readers cannot change mode) or redundancy.
+    if (/^journal_mode\s*=/i.test(trimmedSql)) {
+      // Note: Not 'Sticky' because the file header persists this setting.
+      const writerRes = await this.writer.noLockExecute(payload, false);
+      return writerRes.pragma;
     }
 
     // WRITE MODE
     // 1. Execute on Writer (Primary) - This returns the actual pragma result
     const writerRes = await this.writer.noLockExecute(payload);
 
-    // Sync Readers (Sticky)
-    if (this.readerPool) {
-      await this.readerPool.broadcast(payload, true);
+    // 2. Sync Readers (Sticky)
+    if (this.db.readerPool) {
+      await this.db.readerPool.broadcast(payload, true);
     }
 
     return writerRes.pragma;
@@ -497,18 +597,6 @@ class Connection {
   /**
    * Register a Virtual Table.
    * Broadcasts the table definition to the Writer and all Reader workers.
-   *
-   * @warning The `factory` function is serialized to a string and executed inside the worker threads.
-   * Therefore, it **MUST be strictly self-contained** (pure). It cannot reference variables
-   * from the parent scope (closures) or external libraries not available in the worker context.
-   *
-   * @example
-   * await db.table('my_vtab', function() {
-   *   return {
-   *     rows: function* () { yield [1, 'a']; },
-   *     columns: ['id', 'name']
-   *   };
-   * });
    *
    * @param {string} name - The name of the virtual table.
    * @param {Function} factory - A function that returns the VirtualTableOptions object.

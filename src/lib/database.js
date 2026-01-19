@@ -35,6 +35,9 @@ const Connection = require("./connection");
  * @property {boolean} [readonly=false] - Open the database in read-only mode.
  * @property {boolean} [fileMustExist=false] - If true, throws if the database file does not exist.
  * @property {number} [timeout=5000] - The number of milliseconds to wait when locking the database.
+ * @property {number} [transactionTimeout=30000] - Max duration (ms) for an idle transaction before auto-rollback.
+ * @property {number} [connectionIdleTimeout=5000] - Max duration (ms) of inactivity for a manual connection.
+ * @property {number} [connectionMaxLife=60000] - Max total duration (ms) for a manual connection/transaction.
  * @property {string} [nativeBinding] - Path to the native addon executable.
  * @property {Function} [verbose] - (Verbose logging function).
  */
@@ -153,6 +156,38 @@ class Database extends EventEmitter {
         "options.timeout should not be greater than max 32 bit integer",
       );
     }
+
+    // --- TIMEOUT CONFIGURATION ---
+    if (
+      options.transactionTimeout !== undefined &&
+      (!Number.isInteger(options.transactionTimeout) ||
+        options.transactionTimeout < 0)
+    ) {
+      throw new TypeError(
+        "options.transactionTimeout must be a positive integer",
+      );
+    }
+
+    if (
+      options.connectionIdleTimeout !== undefined &&
+      (!Number.isInteger(options.connectionIdleTimeout) ||
+        options.connectionIdleTimeout < 0)
+    ) {
+      throw new TypeError(
+        "options.connectionIdleTimeout must be a positive integer",
+      );
+    }
+
+    if (
+      options.connectionMaxLife !== undefined &&
+      (!Number.isInteger(options.connectionMaxLife) ||
+        options.connectionMaxLife < 0)
+    ) {
+      throw new TypeError(
+        "options.connectionMaxLife must be a positive integer",
+      );
+    }
+
     if (
       options.nativeBinding !== undefined &&
       typeof options.nativeBinding !== "string"
@@ -165,20 +200,14 @@ class Database extends EventEmitter {
     /** @type {boolean} - True if the database is strictly in-memory. */
     this.memory = filename === ":memory:" || filename === "";
 
-    // console.log("database: ", {
-    //   ...options,
-    //   ...{
-    //     filename,
-    //     readonly: this.readonly,
-    //     memory: this.memory,
-    //   },
-    // });
+    // Store Connection Limits for use in acquire()
+    // Defaults: Max Life = 60s, Idle = 5s
+    this.connectionMaxLife = options.connectionMaxLife || 60000;
+    this.connectionIdleTimeout = options.connectionIdleTimeout || 5000;
 
     if (this.readonly) {
       if (this.memory) {
-        throw new TypeError(
-          "In memory database cannot be reaSQLITE_CANTOPENdonly",
-        );
+        throw new TypeError("In memory database cannot be readonly");
       }
       if (!options.exists) {
         throw new SqliteError(
@@ -213,6 +242,7 @@ class Database extends EventEmitter {
       readonly: this.readonly,
       fileMustExist: !!options.fileMustExist,
       timeout: options.timeout,
+      transactionTimeout: options.transactionTimeout, // passed to worker
       nativeBinding: options.nativeBinding,
       minReaders,
       maxReaders,
@@ -240,13 +270,26 @@ class Database extends EventEmitter {
       readonly: this.readonly,
       fileMustExist: this.options.fileMustExist,
       timeout: this.options.timeout,
+      transactionTimeout: this.options.transactionTimeout, // Pass to worker for heartbeat
       nativeBinding: this.options.nativeBinding,
       verbose: !!this.options.verbose,
     };
 
+    if (
+      options.verbose !== undefined &&
+      options.verbose !== null &&
+      typeof options.verbose !== "function"
+    ) {
+      throw new TypeError("Expected 'verbose' option to be a function");
+    }
+
     /** @type {Function|undefined} */
+    // this.verbose =
+    //   typeof options.verbose === "function" ? options.verbose : undefined;
     this.verbose =
-      typeof options.verbose === "function" ? options.verbose : undefined;
+      typeof options.verbose === "function"
+        ? options.verbose.bind(this)
+        : undefined;
 
     /** @type {AsyncLocalStorage} - Stores the async context of the transaction. */
     this.transactionContext = new AsyncLocalStorage();
@@ -349,9 +392,10 @@ class Database extends EventEmitter {
   /**
    * Creates a new prepared statement.
    * @param {string} sql - The SQL query string.
+   * @param {Object} [options] - Configuration for the statement (e.g. { readonly: true/false }).
    * @returns {Statement} A wrapped Statement instance.
    */
-  prepare(sql) {
+  prepare(sql, options) {
     this._ensureOpen();
 
     if (typeof sql !== "string") {
@@ -366,7 +410,8 @@ class Database extends EventEmitter {
       throw new RangeError("SQL statement cannot start with a semicolon");
     }
 
-    return new Statement(this, sql);
+    // Pass options (if any) to Statement constructor to allow override of Read-Only routing
+    return new Statement(this, sql, options);
   }
 
   /**
@@ -521,6 +566,9 @@ class Database extends EventEmitter {
    * @param {string|Buffer} key
    */
   async key(key) {
+    if (!Buffer.isBuffer(key) && typeof key !== "string") {
+      throw new TypeError("Expected first argument to be a Buffer or String");
+    }
     const payload = { action: "key", key };
     await this._execConfig(payload);
   }
@@ -530,8 +578,16 @@ class Database extends EventEmitter {
    * @param {string|Buffer} key
    */
   async rekey(key) {
-    const payload = { action: "rekey", key };
-    await this._execConfig(payload);
+    // 1. Writer: Executes 'rekey' (rewrites database)
+    if (this.writer) {
+      await this.writer.execute({ action: "rekey", key }, true);
+    }
+
+    // 2. Readers: Execute 'key' (update internal handle to read new format)
+    // Readers cannot 'rekey' (write), so we just give them the new key.
+    if (this.readerPool) {
+      await this.readerPool.broadcast({ action: "key", key }, true);
+    }
   }
 
   /**
@@ -686,39 +742,74 @@ class Database extends EventEmitter {
       throw new TypeError("Options.simple must be a boolean");
     }
 
-    // Use specific 'pragma' action so worker uses db.pragma() instead of db.exec()
+    const trimmedSql = sql.trim();
     const payload = { action: "pragma", sql, options };
 
     // READONLY MODE
     if (this.readonly) {
       if (this.readerPool) {
-        // Sticky broadcast ensuring new readers get this pragma
         const results = await this.readerPool.broadcast(payload, true);
-        // Return the result from the first worker (they should all be identical)
         return results[0].pragma;
       }
       return;
     }
 
-    // WRITE MODE
+    // WRITE MODE (Standard)
     // 1. Execute on Writer (Primary) - This returns the actual pragma result
     let writerRes;
     const activeConn = this.transactionContext.getStore();
 
+    // SPECIAL HANDLING FOR 'REKEY' PRAGMA
+    if (/^rekey\s*=/i.test(trimmedSql)) {
+      let writerRes;
+      // 1. Writer: Execute as-is (Perform rewrite)
+      if (activeConn) {
+        // Inside transaction
+        writerRes = await activeConn.writer.noLockExecute(payload, true);
+      } else {
+        // Atomic
+        // Note: Not 'Sticky' because the file header persists this setting.
+        writerRes = await this.writer.execute(payload, true);
+      }
+
+      // 2. Readers: Convert 'rekey' to 'key'
+      const readerSql = trimmedSql.replace(/^rekey/i, "key");
+      const readerPayload = { action: "pragma", sql: readerSql, options };
+
+      if (this.readerPool) {
+        await this.readerPool.broadcast(readerPayload, true);
+      }
+
+      return writerRes;
+    }
+
+    // SPECIAL HANDLING FOR 'JOURNAL_MODE' PRAGMA
+    // ONLY Execute on Writer. DO NOT Broadcast.
+    // Readers automatically pick up the mode from the file header.
+    // Broadcasting causes errors (readers cannot change mode) or redundancy.
+    if (/^journal_mode\s*=/i.test(trimmedSql)) {
+      if (activeConn) {
+        // Inside transaction
+        const writerRes = await activeConn.writer.noLockExecute(payload, false);
+        return writerRes.pragma;
+      } else {
+        // Atomic
+        // Note: Not 'Sticky' because the file header persists this setting.
+        const writerRes = await this.writer.execute(payload, false);
+        return writerRes.pragma;
+      }
+    }
+
     if (activeConn) {
-      // Inside transaction: We must use the active connection's writer access
-      // and NOT lock, because the transaction already holds the lock.
-      // We call noLockExecute directly to get the return value.
+      // Inside transaction
       writerRes = await activeConn.writer.noLockExecute(payload);
 
-      // We still need to broadcast to readers for consistency
+      // Broadcast to readers (Sticky)
       if (this.readerPool) {
         await this.readerPool.broadcast(payload, true);
       }
     } else {
       // Atomic: Lock and make Sticky
-      // FIX: Do NOT manually lock here. writer.execute() handles locking internally.
-      // The original code wrapped this in this.writer.lock(), causing the deadlock.
       writerRes = await this.writer.execute(payload, true);
     }
 
@@ -751,8 +842,105 @@ class Database extends EventEmitter {
    * @returns {Promise<this>} The Database instance.
    */
   async table(name, factory) {
-    const factoryString = factory.toString();
-    const payload = { action: "table", name, factoryString };
+    if (typeof name !== "string")
+      throw new TypeError("Expected first argument to be a string");
+    if (name.length === 0)
+      throw new TypeError("Expected table name to be a non-empty string");
+    if (
+      typeof factory !== "function" &&
+      (typeof factory !== "object" || factory === null)
+    ) {
+      throw new TypeError(
+        "Expected second argument to be a function or a module object",
+      );
+    }
+
+    let factoryString;
+    let isEponymous = false;
+
+    if (typeof factory === "object") {
+      // 1. Synchronous Validation (Mimic native better-sqlite3 strictness)
+      if (!Array.isArray(factory.columns)) {
+        if (factory.columns === undefined)
+          throw new TypeError("Expected columns to be an array");
+        throw new TypeError("Expected columns to be an array");
+      }
+      if (factory.columns.length === 0)
+        throw new RangeError("Expected columns to be a non-empty array");
+
+      const seen = new Set();
+      for (const col of factory.columns) {
+        if (typeof col !== "string")
+          throw new TypeError("Expected column names to be strings");
+        if (seen.has(col)) throw new TypeError("Duplicate column name");
+        seen.add(col);
+      }
+
+      if (factory.parameters !== undefined) {
+        if (!Array.isArray(factory.parameters))
+          throw new TypeError("Expected parameters to be an array");
+        if (factory.parameters.length > 32)
+          throw new RangeError("Too many parameters");
+        const seenParams = new Set();
+        for (const param of factory.parameters) {
+          if (typeof param !== "string")
+            throw new TypeError("Expected parameter names to be strings");
+          if (seenParams.has(param))
+            throw new TypeError("Duplicate parameter name");
+          seenParams.add(param);
+        }
+      }
+
+      if (typeof factory.rows !== "function")
+        throw new TypeError("Expected rows to be a generator function");
+
+      const len = factory.rows.length;
+      if (!Number.isInteger(len) || len < 0)
+        throw new TypeError(
+          "Expected function.length to be a non-negative integer",
+        );
+      if (len > 32)
+        throw new RangeError("Virtual table module has too many parameters");
+
+      // 2. Manual Serialization for Objects (Eponymous Wrapper)
+      const cols = JSON.stringify(factory.columns);
+      const params = factory.parameters
+        ? JSON.stringify(factory.parameters)
+        : "undefined";
+      const rowsStr = factory.rows.toString().trim();
+
+      // FIX: Correctly determine if rowsStr is a Method Definition or Function Expression
+      let methodPart;
+
+      // If it starts with 'function', '(', 'async function', or 'async (', it needs a key "rows:"
+      // If it starts with 'rows', '*rows', 'async rows', it INCLUDES the key (Method Shorthand).
+      if (
+        rowsStr.startsWith("function") ||
+        rowsStr.startsWith("(") ||
+        rowsStr.startsWith("async function") ||
+        rowsStr.startsWith("async (")
+      ) {
+        methodPart = `rows: ${rowsStr}`;
+      } else {
+        // Assume Method Shorthand (e.g. "*rows() {}", "rows() {}")
+        // This must be pasted AS IS into the object literal.
+        methodPart = rowsStr;
+      }
+
+      factoryString = `() => ({
+         columns: ${cols},
+         parameters: ${params},
+         ${methodPart}
+       })`;
+
+      isEponymous = true;
+    } else {
+      // Function (Module)
+      factoryString = factory.toString();
+      isEponymous = false;
+    }
+
+    const payload = { action: "table", name, factoryString, isEponymous };
     await this._execConfig(payload);
     return this;
   }

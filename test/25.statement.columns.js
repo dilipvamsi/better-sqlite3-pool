@@ -22,7 +22,7 @@ describe("Statement#columns()", function () {
       stmt.columns();
       throw new Error("Should have thrown SqliteError");
     } catch (err) {
-      expect(err).to.be.instanceof(SqliteError);
+      expect(err.name).to.equal("SqliteError");
       expect(err.code).to.equal("SQLITE_MISUSE");
     }
   });

@@ -3,9 +3,9 @@
  * @description Main entry point for better-sqlite3-pool.
  */
 
-const { SqliteError } = require("better-sqlite3-multiple-ciphers");
 const { Database } = require("./lib/database");
 const Statement = require("./lib/statement");
+const { SqliteError } = require("./lib/utils");
 
 // --- STATIC EXPORTS ---
 // 1. Expose SqliteError for instanceof checks

@@ -368,16 +368,15 @@ describe("Statement#iterate()", function () {
     try {
       const it = this.db.prepare(SQL2).iterate();
       await it.next();
-      throw new Error("Should have thrown TypeError/RangeError");
+      throw new Error("Should have thrown TypeError");
     } catch (err) {
-      // Better-sqlite3 throws RangeError for missing params
       expect(err).to.be.instanceof(TypeError);
     }
 
     try {
       const it = this.db.prepare(SQL2).iterate(row, {});
       await it.next();
-      throw new Error("Should have thrown TypeError/RangeError");
+      throw new Error("Should have thrown TypeError");
     } catch (err) {
       expect(err).to.be.instanceof(TypeError);
     }
@@ -385,7 +384,7 @@ describe("Statement#iterate()", function () {
     try {
       const it = this.db.prepare(SQL2).iterate({});
       await it.next();
-      throw new Error("Should have thrown TypeError/RangeError");
+      throw new Error("Should have thrown RangeError");
     } catch (err) {
       expect(err).to.be.instanceof(RangeError);
     }

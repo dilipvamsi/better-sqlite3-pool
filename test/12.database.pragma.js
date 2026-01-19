@@ -1,5 +1,6 @@
 "use strict";
 const Database = require("../src");
+const { SqliteError } = Database;
 
 describe("Database#pragma()", function () {
   beforeEach(async function () {
@@ -32,10 +33,7 @@ describe("Database#pragma()", function () {
     );
   });
   it("should throw an exception if invalid/redundant SQL is provided", async function () {
-    await expectRejection(
-      this.db.pragma("PRAGMA cache_size"),
-      Database.SqliteError,
-    );
+    await expectRejection(this.db.pragma("PRAGMA cache_size"), SqliteError);
     await expectRejection(
       this.db.pragma("cache_size; PRAGMA cache_size"),
       RangeError,
@@ -73,12 +71,12 @@ describe("Database#pragma()", function () {
       -8000,
     );
     // original will fail as writer is running with wal mode
-    // expect(await this.db.pragma("journal_mode", { simple: true })).to.equal(
-    //   "delete",
-    // );
     expect(await this.db.pragma("journal_mode", { simple: true })).to.equal(
-      "wal",
+      "delete",
     );
+    // expect(await this.db.pragma("journal_mode", { simple: true })).to.equal(
+    //   "wal",
+    // );
     await this.db.pragma("journal_mode = wal");
     expect(await this.db.pragma("journal_mode", { simple: true })).to.equal(
       "wal",

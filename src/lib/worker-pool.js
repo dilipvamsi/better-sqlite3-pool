@@ -48,10 +48,11 @@ const kMultiWorker = Symbol("MultiWorker");
  * @typedef {Object} WorkerMessage
  * @description The raw message structure received from the Worker Thread.
  * @property {string} requestId - Unique ID correlating to a pending promise.
- * @property {'success' | 'done' | 'error' | 'next' | 'log' | 'ready'} status - Outcome status.
+ * @property {'success' | 'done' | 'error' | 'next' | 'log' | 'ready' | 'transaction_close'} status - Outcome status.
  * @property {any} [data] - Payload for success, done, or next events.
  * @property {SerializedError} [error] - Error details (if status is error).
  * @property {boolean} [inTransaction] - Indicates if the statement is within a transaction.
+ * @property {string} [transactionId] - The ID of the transaction session.
  */
 
 /**
@@ -193,6 +194,9 @@ class SingleWorkerClient extends EventEmitter {
 
     /** @type {boolean} Indicates whether the worker is currently in a transaction */
     this.inTransaction = false;
+
+    /** @type {string|null} The unique ID of the current transaction session, if any */
+    this.currentTransactionId = null;
   }
 
   /**
@@ -492,10 +496,37 @@ class SingleWorkerClient extends EventEmitter {
    * @private
    * @param {WorkerMessage} message - The worker message.
    */
-  _handleMessage({ requestId, status, data, error, inTransaction }) {
+  _handleMessage({
+    requestId,
+    status,
+    data,
+    error,
+    inTransaction,
+    transactionId,
+  }) {
     // If the worker reported a transaction state, update our local tracker.
     if (typeof inTransaction === "boolean") {
       this.inTransaction = inTransaction;
+      if (inTransaction && transactionId) {
+        this.currentTransactionId = transactionId;
+      } else if (!inTransaction) {
+        // If not in transaction, clear the ID
+        this.currentTransactionId = null;
+      }
+    }
+
+    // --- TRANSACTION TIMEOUT / CLOSE ---
+    if (status === "transaction_close") {
+      console.warn(
+        `[better-sqlite3-pool] Transaction ${transactionId || "unknown"} in worker ${this.id} auto-rolled back due to timeout.`,
+        error,
+      );
+      // Reset local state
+      this.inTransaction = false;
+      this.currentTransactionId = null;
+      // Emit generic error event so DB class can perhaps invalidate connection wrappers
+      this.emit("transaction_timeout", createErrorByType(error));
+      return;
     }
 
     // --- READY ---
@@ -505,18 +536,44 @@ class SingleWorkerClient extends EventEmitter {
     }
     // --- BOOT ERROR ---
     if (status === "boot_error") {
-      this.emit("boot_error", new Error(data));
+      this.emit("boot_error", createErrorByType(error));
       return;
     }
     // --- SETUP ERROR ---
     if (status === "setup_error") {
-      this.emit("error", new Error(data));
+      this.emit("error", createErrorByType(error));
       return;
     }
     // --- LOGGING (Global, not strictly tied to request state) ---
     if (status === "log") {
       if (typeof this.onLog === "function") {
-        this.onLog(data);
+        try {
+          this.onLog(data);
+        } catch (logErr) {
+          // If the verbose function throws, we try to fail the specific request
+          if (requestId && this.requestMap.has(requestId)) {
+            const task = this.requestMap.get(requestId);
+
+            // Remove from map immediately to prevent further resolution
+            this.requestMap.delete(requestId);
+            this.activeRequests--;
+
+            // Reject the promise
+            if (task.reject) {
+              task.reject(logErr);
+            } else if (task.streamCtx) {
+              task.streamCtx.error = logErr;
+              if (task.streamCtx.wake) task.streamCtx.wake();
+            }
+          } else {
+            // Fallback: Emit global error if we can't tie it to a request
+            console.error(
+              "[better-sqlite3-pool] Verbose logger threw error:",
+              logErr,
+            );
+            this.emit("error", logErr);
+          }
+        }
       }
       return;
     }
@@ -573,8 +630,7 @@ class SingleWorkerClient extends EventEmitter {
     if (status === "success") {
       task.resolve(data);
     } else if (status === "error" || error) {
-      const finalError = createErrorByType(error);
-      finalError.__data = data;
+      const finalError = createErrorByType(error, data);
       task.reject(finalError);
     } else if (status === "next" || status === "done") {
       // Protocol Violation: Standard request shouldn't get stream events

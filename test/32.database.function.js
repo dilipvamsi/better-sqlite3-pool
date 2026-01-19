@@ -5,6 +5,7 @@ const { SqliteError } = Database;
 describe("Database#function()", function () {
   beforeEach(async function () {
     this.db = await Database.create(util.next());
+    await this.db.pragma("journal_mode = WAL"); // Explicitly enable WAL
     this.get = async (SQL, ...args) => {
       return await this.db.prepare(`SELECT ${SQL}`).pluck().get(args);
     };
