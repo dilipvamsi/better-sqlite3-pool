@@ -1273,4 +1273,4 @@ class Database extends EventEmitter {
   }
 }
 
-module.exports = { Database };
+module.exports = Database;

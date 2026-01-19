@@ -1,63 +1,83 @@
 # better-sqlite3-pool
 
-A non-blocking, multi-threaded, auto-scaling SQLite connection pool built on top of `better-sqlite3-multiple-ciphers`.
+A **non-blocking**, **multi-threaded**, **auto-scaling** SQLite connection pool built on top of `better-sqlite3-multiple-ciphers`.
 
-Designed for high-concurrency Node.js applications that need the speed of SQLite and the security of **SQLCipher encryption** without blocking the main event loop.
+Designed for high-concurrency Node.js applications (like REST APIs or GraphQL servers) that need the speed of SQLite and the security of **SQLCipher encryption** without blocking the main event loop.
 
-## Features
+## 🚀 Why this exists?
 
-- **Non-Blocking:** Moves CPU-heavy queries (and decryption) to Worker Threads.
-- **Encrypted Support:** Full support for SQLCipher, wxSQLite3, and multiple-ciphers.
-- **Auto-Scaling:** Spawns more Reader Workers as load increases.
-- **True Concurrency:** Reads run in parallel across multiple CPU cores.
-- **TypeORM Support:** Drop-in adapter included.
-- **BigInt Safety:** Smart casting for large integers (Schema-Aware).
-- **Streaming:** Iterators with backpressure for massive datasets.
+The standard `better-sqlite3` is the fastest driver available, but it is **synchronous**.
+1.  **The Blocking Problem:** If a query takes 50ms, your Node.js server cannot handle *any* other requests during that time.
+2.  **The Encryption Penalty:** Using SQLCipher adds heavy CPU overhead for decryption. Running this on the main thread kills throughput.
+
+**better-sqlite3-pool solves this** by moving all database operations to Worker Threads.
+
+## ✨ Features
+
+-   **🚫 Non-Blocking:** All queries return `Promises`. Your event loop stays free.
+-   **🔒 Encrypted Support:** Native support for **SQLCipher**, **wxSQLite3**, and **AES-256**.
+-   **⚡ True Concurrency:** Read queries run in parallel across multiple workers/cores.
+-   **📈 Auto-Scaling:** Spawns more Reader Workers automatically as load increases.
+-   **💾 WAL-Safe Encryption:** Smart handling of Journal Modes to prevent header corruption on encrypted files.
+-   **❤️ Transaction Heartbeats:** Auto-rollbacks stalled transactions to prevent "database locked" deadlocks.
+-   **🔌 SQLite3 Adapter:** Drop-in compatibility mode for legacy libraries.
 
 ---
 
-## Installation
-
-Replace the standard driver with the cipher-enabled version:
+## 📦 Installation
 
 ```bash
 npm install better-sqlite3-pool
 ```
 
+*Note: You do not need to install `better-sqlite3` separately.*
+
 ---
 
-## Basic Usage
+## 🆚 Comparison: Original vs. Pool
 
-The API mirrors `better-sqlite3` but is **Promise-based**.
+| Feature | `better-sqlite3` (Original) | `better-sqlite3-pool` (This Library) |
+| :--- | :--- | :--- |
+| **API Style** | **Synchronous** (Blocking) | **Asynchronous** (Promises/Await) |
+| **Concurrency** | 1 Query at a time (Serialized) | **Parallel Reads** (Writer + N Readers) |
+| **Main Thread** | Blocked during queries | **Free** to handle HTTP requests |
+| **Encryption** | Blocks event loop (High CPU) | **Offloaded** to Worker Threads |
+| **Transactions** | Blocks everything | Blocks Writer only (Readers continue) |
+| **UDF Functions** | Can use closures | Pure functions only (Serialized) |
+| **Best For** | Desktop Apps, CLI, Scripts | **Web Servers, APIs, Electron Main** |
 
-To use an encrypted database, simply broadcast the `key` pragma immediately after initialization.
+---
+
+## 🛠 Basic Usage
+
+Initialization is asynchronous to ensure workers are ready.
 
 ```javascript
-const Database = require("better-sqlite3-pool");
-
-// Initialize the pool
-const db = new Database("encrypted-data.db", { min: 2, max: 4 });
+const { Database } = require("better-sqlite3-pool");
 
 async function main() {
-  // 0. Unlock the database (Broadcasts to all workers)
-  await db.pragma('key = "my-secret-password"');
+  // 1. Initialize the pool (Factory Pattern)
+  const db = await Database.create("my-database.db", {
+    minWorkers: 2, // Always keep 2 readers alive
+    maxWorkers: 4, // Scale up to 4 readers under load
+  });
 
-  // 1. Prepare & Run (Write)
-  const result = await db
+  // 2. Writes (Sent to the single Writer thread)
+  const res = await db
     .prepare("INSERT INTO users (name) VALUES (?)")
     .run("Alice");
-  console.log(result.lastInsertRowid); // BigInt (e.g. 1n)
+  
+  console.log(`Inserted ID: ${res.lastInsertRowid}`);
 
-  // 2. Read (Auto-scaled to available reader)
+  // 3. Reads (Load balanced across Reader threads)
   const user = await db
     .prepare("SELECT * FROM users WHERE id = ?")
-    .get(result.lastInsertRowid);
+    .get(res.lastInsertRowid);
+
   console.log(user);
 
-  // 3. Streaming (Low Memory)
-  for await (const row of db.prepare("SELECT * FROM large_table").iterate()) {
-    console.log(row.name);
-  }
+  // 4. Shutdown
+  await db.close();
 }
 
 main();
@@ -65,96 +85,163 @@ main();
 
 ---
 
-## TypeORM Configuration
+## 🔐 Encryption Usage
 
-To use with TypeORM, point the driver to the included adapter.
+When using encryption, you must tell the pool the file is encrypted so it handles the WAL (Write-Ahead Log) header correctly.
 
-```typescript
-import { DataSource } from "typeorm";
-import * as Driver from "better-sqlite3-pool/adapter";
 
-export const AppDataSource = new DataSource({
-  type: "sqlite",
-  driver: Driver, // Inject our adapter
-  database: "secure.sqlite",
-  synchronize: true,
-  entities: ["src/entity/**/*.ts"],
-  // Pass connection hooks to unlock the DB
-  pool: {
-    afterCreate: async (conn) => {
-      await conn.pragma('key = "secret-key"');
-    },
-  },
-});
+### Creating a new Encrypted Database file
+
+```javascript
+const db = await Database.create("secure.db");
+
+// Should rekey the database to initialize the database with key
+// As key can not be set on new database opened on WAL mode
+await db.pragma("rekey = 'secret-password'");
+
+// Now you can safely enable WAL mode for performance
+await db.pragma("journal_mode = WAL");
+
+await db.exec("CREATE TABLE IF NOT EXISTS confidential (data TEXT)");
 ```
 
-### BigInt Handling in TypeORM
+### Opening an existing Encrypted Database
 
-This driver automatically converts "safe" integers (up to `2^53`) to JavaScript Numbers. Huge integers remain as `BigInt`.
+```javascript
+const db = await Database.create("secure.db");
 
-```typescript
-@Entity()
-export class User {
-  @PrimaryGeneratedColumn({ type: "integer" })
-  id: bigint; // TypeORM maps this correctly
+// Broadcast the key to ALL workers (Writer + Readers)
+await db.pragma("key = 'secret-password'");
 
-  @Column({ type: "integer" })
-  status: number; // Small numbers are automatically cast to Number
+// Now you can safely enable WAL mode for performance
+await db.pragma("journal_mode = WAL");
+
+await db.exec("CREATE TABLE IF NOT EXISTS confidential (data TEXT)");
+```
+
+### Rekeying (Changing Password)
+
+```javascript
+// Change password from 'old' to 'new'
+await db.rekey("new-password");
+```
+
+---
+
+## ⚡ Transactions
+
+### Managed Transactions (Recommended)
+This wrapper automatically acquires a connection, begins the transaction, runs your logic, and commits (or rolls back on error).
+
+```javascript
+const insertMany = db.transaction(async (users) => {
+  const stmt = db.prepare("INSERT INTO users (name) VALUES (?)");
+  for (const user of users) {
+    await stmt.run(user);
+  }
+});
+
+// Takes an exclusive lock on the Writer
+await insertMany(["Bob", "Charlie", "Dave"]);
+```
+
+### Manual Acquisition (Advanced)
+If you need granular control, you can acquire an exclusive session on the Writer.
+
+```javascript
+// Locks the writer worker. No other writes can happen until release().
+const conn = await db.acquire();
+
+try {
+  await conn.exec("BEGIN");
+  await conn.prepare("INSERT INTO log VALUES (?)").run("Log 1");
+
+  // Do some heavy calculation...
+
+  await conn.prepare("INSERT INTO log VALUES (?)").run("Log 2");
+  await conn.exec("COMMIT");
+} catch (err) {
+  await conn.exec("ROLLBACK");
+} finally {
+  // CRITICAL: Must release to unlock the pool
+  conn.release();
+}
+```
+
+**Safety:** If your code crashes or hangs while holding a connection, the `transactionTimeout` (default 30s) will automatically rollback and release the lock.
+
+---
+
+## 🌊 Streaming (Iterators)
+
+For large datasets, use `.iterate()`. This uses a backpressure mechanism to stream rows from the worker without loading them all into RAM.
+
+```javascript
+const stmt = db.prepare("SELECT * FROM huge_table");
+
+for await (const row of stmt.iterate()) {
+  console.log(row.name);
+  // The worker pauses fetching until you ask for the next row
 }
 ```
 
 ---
 
-## Architecture & Performance
+## 🔌 Legacy / TypeORM Adapter
 
-| Feature             | Standard better-sqlite3 | better-sqlite3-pool               |
-| :------------------ | :---------------------- | :-------------------------------- |
-| **Backend**         | Standard SQLite         | **Multiple Ciphers (Encryption)** |
-| **Blocking**        | Yes (Blocks Loop)       | **No (Async)**                    |
-| **Decryption Cost** | Blocks Main Thread      | **Offloaded to Workers**          |
-| **Concurrency**     | Serialized              | **Parallel Reads**                |
-| **BigInt**          | ✅ Native                | **✅ Native (Smart Cast)**         |
-| **Best For**        | CLI / Desktop           | **Secure Web Servers / API**      |
+If you are using **TypeORM**, **Sequelize**, or a library expecting the legacy `sqlite3` callback API, use the included adapter.
 
-### How it works
+```javascript
+// In TypeORM options
+const { Database, verbose } = require("better-sqlite3-pool/adapter");
 
-1.  **Writer:** A single worker thread handles all writes (`INSERT`, `UPDATE`, transactions) sequentially.
-2.  **Readers:** A pool of worker threads handles `SELECT` queries.
-3.  **Encryption:** Decryption overhead is distributed across the worker threads, keeping the Node.js event loop responsive even with heavy encryption settings (e.g., high iteration counts).
+const dataSource = new DataSource({
+  type: "sqlite",
+  database: "test.db",
+  driver: {
+    Database: Database, // Pass the adapter class
+    verbose: verbose    // Optional
+  },
+  // ... other options
+});
+```
 
 ---
 
-## Advanced API
-
-### Pragma Broadcasting
-
-Changes apply to **ALL** current and future workers. This is essential for setting encryption keys or WAL mode.
+## ⚙️ Configuration Options
 
 ```javascript
-// Enable WAL mode (recommended for performance)
-await db.pragma("journal_mode = WAL");
+const db = await Database.create("file.db", {
+  // Worker Pool Settings
+  minWorkers: 1,        // Minimum readers (Default: 1)
+  maxWorkers: 4,        // Maximum readers (Default: 2)
 
-// Rekey the database
-await db.pragma('rekey = "new-password"');
+  // Database Settings
+  readonly: false,      // Open in read-only mode
+  fileMustExist: false, // Throw if file missing
+  nativeBinding: null,  // Path to custom .node addon
+
+  // Timeouts
+  timeout: 5000,              // SQLite busy timeout
+  transactionTimeout: 30000,  // Max time a transaction can stay idle
+  connectionMaxLife: 60000,   // Max duration of an acquired connection
+
+  // Logging
+  verbose: console.log, // Log executed SQL
+});
 ```
 
-### User Defined Functions (UDF)
+## ⚠️ Limitations & Gotchas
 
-Functions are stringified and broadcast to all workers.
+1.  **User Defined Functions (UDFs):**
+    *   Since functions run in a separate Worker thread, they **cannot close over variables** from your main thread. They must be "pure" or self-contained.
+    *   *Bad:* `let count = 0; db.function('fn', () => count++)` (Count stays 0 in main thread).
+    *   *Good:* `db.function('add', (a, b) => a + b)`
+2.  **In-Memory Databases:**
+    *   `:memory:` databases cannot be shared across threads. If you use one, the pool effectively becomes a single-threaded wrapper around the Writer.
+3.  **Host Parameters:**
+    *   Standard `better-sqlite3` allows binding standard JS objects. Since we pass data via `postMessage`, arguments must be **serializable** (no Functions, Promises, or Symbols as parameters).
 
-```javascript
-await db.function("is_expensive", (price) => (price > 100 ? 1 : 0));
-const row = await db
-  .prepare("SELECT is_expensive(price) as exp FROM products")
-  .get();
-```
+## 📜 License
 
-### Row Modes
-
-```javascript
-// Return array: [1, 'Alice']
-const rows = await db.prepare("SELECT id, name FROM users").raw().all();
-
-// Return value: 1
-const id = await db.prepare("SELECT id FROM users").pluck().get();
-```
+MIT
