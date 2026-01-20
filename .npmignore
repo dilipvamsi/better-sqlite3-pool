@@ -1,0 +1,23 @@
+# Source control
+.git
+.gitignore
+
+# Tests
+test/
+*.test.js
+
+# IDE settings
+.vscode
+.idea
+
+# Local/Temp files
+*.db
+*.db-wal
+*.db-shm
+temp/
+node_modules/
+package-lock.json
+
+# CI/CD
+.github
+.travis.yml

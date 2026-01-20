@@ -1,25 +1,34 @@
 {
   "name": "better-sqlite3-pool",
-  "version": "0.1.0",
-  "description": "A non-blocking, multi-threaded, auto-scaling SQLite connection pool with TypeORM support.",
+  "version": "1.0.0",
+  "description": "A non-blocking, multi-threaded, auto-scaling SQLite connection pool with encryption support.",
   "main": "./src/index.js",
   "types": "./src/index.d.ts",
   "scripts": {
     "test": "mocha --exit --slow=75 --timeout=30000",
     "test:file": "mocha --exit --slow=75 --timeout=30000 test/00.setup.js"
   },
+  "files": [
+    "src/",
+    "LICENSE",
+    "README.md"
+  ],
   "engines": {
     "node": "20.x || 22.x || 23.x || 24.x"
   },
   "keywords": [
     "sqlite",
+    "sqlite3",
     "better-sqlite3",
     "pool",
+    "worker-threads",
     "async",
     "worker",
     "threads",
-    "typeorm",
-    "bigint"
+    "bigint",
+    "encryption",
+    "sqlcipher",
+    "concurrency"
   ],
   "author": "dilipvamsi",
   "license": "MIT",
@@ -30,5 +39,9 @@
     "chai": "^6.2.2",
     "fs-extra": "^11.3.3",
     "mocha": "^11.7.5"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dilipvamsi/better-sqlite3-pool"
   }
 }
