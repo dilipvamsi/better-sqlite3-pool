@@ -1,6 +1,6 @@
 {
   "name": "better-sqlite3-pool",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A non-blocking, multi-threaded, auto-scaling SQLite connection pool with encryption support.",
   "main": "./src/index.js",
   "types": "./src/index.d.ts",
