@@ -61,48 +61,48 @@ function castRow(row, columns) {
 
 /**
  * Reconstructs a genuine SqliteError or Error from the worker payload.
- * @param {Object} errPayload - { message, code }
+ * @param {Object} errorPayload - { message, code }
  * @param {any} data - Additional data to include in the error.
  * @returns {Error}
  */
-function createErrorByType(error, data = undefined) {
+function createErrorByType(errorPayload, data = undefined) {
   let err;
   // console.log(error);
-  switch (error.name) {
+  switch (errorPayload.name) {
     case "TypeError":
-      err = new TypeError(error.message);
+      err = new TypeError(errorPayload.message);
       break;
     case "RangeError":
-      err = new RangeError(error.message);
+      err = new RangeError(errorPayload.message);
       break;
     case "ReferenceError":
-      err = new ReferenceError(error.message);
+      err = new ReferenceError(errorPayload.message);
       break;
     case "SyntaxError":
-      err = new SyntaxError(error.message);
+      err = new SyntaxError(errorPayload.message);
       break;
     case "URIError":
-      err = new URIError(error.message);
+      err = new URIError(errorPayload.message);
       break;
     case "URIError":
-      err = new URIError(error.message);
+      err = new URIError(errorPayload.message);
       break;
     case "EvalError":
-      err = new EvalError(error.message);
+      err = new EvalError(errorPayload.message);
       break;
     case "AggregateError":
-      err = new AggregateError(error.message);
+      err = new AggregateError(errorPayload.message);
       break;
     case "Error":
-      err = new Error(error.message);
+      err = new Error(errorPayload.message);
       break;
     case "SqliteError":
-      err = new SqliteError(error.message, error.code, data);
+      err = new SqliteError(errorPayload.message, errorPayload.code, data);
       break;
     default:
-      err = new Error(error.message);
+      err = new Error(errorPayload.message);
   }
-  if (data && error.name !== "SqliteError") {
+  if (data && errorPayload.name !== "SqliteError") {
     err.__data = data;
   }
   return err;
@@ -110,7 +110,7 @@ function createErrorByType(error, data = undefined) {
 
 /**
  * Check if the file exists.
- * @param {string} path - file path
+ * @param {string} filePath - file path
  * @returns {Promise<boolean>}
  */
 async function fileExists(filePath) {
@@ -129,7 +129,7 @@ async function fileExists(filePath) {
 
 /**
  * Check if the parent directory exists.
- * @param {string} path - file path
+ * @param {string} targetPath - file path
  * @returns {Promise<boolean>}
  */
 async function parentDirectoryExists(targetPath) {

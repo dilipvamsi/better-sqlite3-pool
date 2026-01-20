@@ -555,6 +555,8 @@ class Connection {
       throw new TypeError("Options.simple must be a boolean");
     }
 
+    const trimmedSql = sql.trim();
+
     // Use specific 'pragma' action so worker uses db.pragma() instead of db.exec()
     const payload = { action: "pragma", sql, options };
 
@@ -729,6 +731,65 @@ class Connection {
     const payload = { action: "table", name, factoryString, isEponymous };
     await this._execConfig(payload);
     return this;
+  }
+
+  /**
+   * Attaches an external database within this connection context.
+   * NOTE: This broadcasts the ATTACH command to the entire pool to maintain schema consistency.
+   *
+   * @param {string} filename - Path to the database file.
+   * @param {string} alias - Alias name for the attached database.
+   * @param {Object} [options] - Configuration options.
+   * @param {string} [options.journalMode] - Optional. Sets the journal_mode for the attached DB.
+   * @param {boolean} [options.fileMustExist=false] - If true, throws if the file does not exist.
+   */
+  async attach(filename, alias, options = {}) {
+    this._ensureActive();
+    if (typeof filename !== "string")
+      throw new TypeError("Filename must be a string");
+    if (typeof alias !== "string")
+      throw new TypeError("Alias must be a string");
+
+    if (options.fileMustExist) {
+      const exists = await fileExists(filename);
+      if (!exists) {
+        throw new SqliteError(
+          `Attached database file "${filename}" does not exist`,
+          "SQLITE_CANTOPEN",
+        );
+      }
+    }
+
+    const sql = `ATTACH DATABASE '${filename}' AS ${alias}`;
+
+    // Broadcast via _execConfig (Sticky)
+    await this._execConfig({ action: "exec", sql });
+
+    if (options.journalMode) {
+      if (typeof options.journalMode !== "string") {
+        throw new TypeError("options.journalMode must be a string");
+      }
+      const mode = options.journalMode.toUpperCase();
+      const pragmaSql = `PRAGMA ${alias}.journal_mode = ${mode}`;
+
+      // Execute on the specific writer connection this object holds
+      await this.writer.noLockExecute({ action: "exec", sql: pragmaSql });
+    }
+  }
+
+  /**
+   * Detaches a database.
+   * NOTE: This broadcasts the DETACH command to the entire pool.
+   *
+   * @param {string} alias
+   */
+  async detach(alias) {
+    this._ensureActive();
+    if (typeof alias !== "string")
+      throw new TypeError("Alias must be a string");
+
+    const sql = `DETACH DATABASE ${alias}`;
+    await this._execConfig({ action: "exec", sql });
   }
 }
 

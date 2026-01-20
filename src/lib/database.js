@@ -1120,6 +1120,96 @@ class Database extends EventEmitter {
   }
 
   /**
+   * Attaches an external database to the current connection pool.
+   * This ensures the database is attached on the Writer and all Reader workers.
+   *
+   * @param {string} filename - Path to the database file.
+   * @param {string} alias - Alias name for the attached database.
+   * @param {Object} [options] - Configuration options.
+   * @param {string} [options.journalMode] - Optional. Sets the journal_mode for the attached DB (e.g. 'WAL').
+   * @param {boolean} [options.fileMustExist=false] - If true, throws if the file does not exist.
+   * @returns {Promise<void>}
+   */
+  async attach(filename, alias, options = {}) {
+    this._ensureOpen();
+
+    if (typeof filename !== "string") {
+      throw new TypeError("Filename must be a string");
+    }
+    if (typeof alias !== "string") {
+      throw new TypeError("Alias must be a string");
+    }
+
+    if (options.fileMustExist) {
+      const exists = await fileExists(filename);
+      if (!exists) {
+        throw new SqliteError(
+          `Attached database file "${filename}" does not exist`,
+          "SQLITE_CANTOPEN",
+        );
+      }
+    }
+
+    // 1. Construct the ATTACH statement
+    // We use a simple string interpolation.
+    // Security Note: Ensure 'filename' and 'alias' are trusted or sanitized if coming from user input.
+    const sql = `ATTACH DATABASE '${filename}' AS ${alias}`;
+
+    // 2. Broadcast ATTACH to all workers (Writer + Readers) and mark as Sticky.
+    // This ensures current and future workers have this DB attached.
+    await this._execConfig({ action: "exec", sql });
+
+    // 3. Handle Journal Mode (Optional)
+    // We only need to execute this on the Writer. The file header change will apply to readers automatically.
+    if (options.journalMode) {
+      if (typeof options.journalMode !== "string") {
+        throw new TypeError("options.journalMode must be a string");
+      }
+
+      const mode = options.journalMode.toUpperCase();
+      const pragmaSql = `PRAGMA ${alias}.journal_mode = ${mode}`;
+
+      // We manually route to the Writer instead of using db.pragma()
+      // because we don't want to broadcast this setting to read-only workers
+      // (which might throw errors trying to change journal modes).
+      if (this.writer) {
+        // If we are currently in a transaction, use the active connection
+        const activeConn = this.transactionContext.getStore();
+        if (activeConn) {
+          await activeConn.writer.noLockExecute({
+            action: "exec",
+            sql: pragmaSql,
+          });
+        } else {
+          // Atomic execution on writer.
+          // Note: We don't mark this as sticky. The journal_mode is persisted in the database file header.
+          await this.writer.execute({ action: "exec", sql: pragmaSql }, false);
+        }
+      }
+    }
+  }
+
+  /**
+   * Detaches a database from the connection pool.
+   *
+   * @param {string} alias - The alias of the database to detach.
+   * @returns {Promise<void>}
+   */
+  async detach(alias) {
+    this._ensureOpen();
+    if (typeof alias !== "string") {
+      throw new TypeError("Alias must be a string");
+    }
+
+    const sql = `DETACH DATABASE ${alias}`;
+
+    // Broadcast DETACH to all workers and mark as Sticky.
+    // This effectively appends a DETACH to the initialization history,
+    // ensuring new workers don't keep the attached DB.
+    await this._execConfig({ action: "exec", sql });
+  }
+
+  /**
    * Close the database connection pool.
    * Sends a graceful close signal to workers to allow SQLite to checkpoint WAL,
    * then terminates the threads.
