@@ -7,20 +7,21 @@ Designed for high-concurrency Node.js applications (like REST APIs or GraphQL se
 ## 🚀 Why this exists?
 
 The standard `better-sqlite3` is the fastest driver available, but it is **synchronous**.
-1.  **The Blocking Problem:** If a query takes 50ms, your Node.js server cannot handle *any* other requests during that time.
-2.  **The Encryption Penalty:** Using SQLCipher adds heavy CPU overhead for decryption. Running this on the main thread kills throughput.
+
+1. **The Blocking Problem:** If a query takes 50ms, your Node.js server cannot handle *any* other requests during that time.
+2. **The Encryption Penalty:** Using SQLCipher adds heavy CPU overhead for decryption. Running this on the main thread kills throughput.
 
 **better-sqlite3-pool solves this** by moving all database operations to Worker Threads.
 
 ## ✨ Features
 
--   **🚫 Non-Blocking:** All queries return `Promises`. Your event loop stays free.
--   **🔒 Encrypted Support:** Native support for **SQLCipher**, **wxSQLite3**, and **AES-256**.
--   **⚡ True Concurrency:** Read queries run in parallel across multiple workers/cores.
--   **📈 Auto-Scaling:** Spawns more Reader Workers automatically as load increases.
--   **💾 WAL-Safe Encryption:** Smart handling of Journal Modes to prevent header corruption on encrypted files.
--   **❤️ Transaction Heartbeats:** Auto-rollbacks stalled transactions to prevent "database locked" deadlocks.
--   **🔌 SQLite3 Adapter:** Drop-in compatibility mode for legacy libraries.
+- **🚫 Non-Blocking:** All queries return `Promises`. Your event loop stays free.
+- **🔒 Encrypted Support:** Native support for **SQLCipher**, **wxSQLite3**, and **AES-256**.
+- **⚡ True Concurrency:** Read queries run in parallel across multiple workers/cores.
+- **📈 Auto-Scaling:** Spawns more Reader Workers automatically as load increases.
+- **💾 WAL-Safe Encryption:** Smart handling of Journal Modes to prevent header corruption on encrypted files.
+- **❤️ Transaction Heartbeats:** Auto-rollbacks stalled transactions to prevent "database locked" deadlocks.
+- **🔌 SQLite3 Adapter:** Drop-in compatibility mode for legacy libraries.
 
 ---
 
@@ -66,7 +67,7 @@ async function main() {
   const res = await db
     .prepare("INSERT INTO users (name) VALUES (?)")
     .run("Alice");
-  
+
   console.log(`Inserted ID: ${res.lastInsertRowid}`);
 
   // 3. Reads (Load balanced across Reader threads)
@@ -88,7 +89,6 @@ main();
 ## 🔐 Encryption Usage
 
 When using encryption, you must tell the pool the file is encrypted so it handles the WAL (Write-Ahead Log) header correctly.
-
 
 ### Creating a new Encrypted Database file
 
@@ -131,6 +131,7 @@ await db.rekey("new-password");
 ## ⚡ Transactions
 
 ### Managed Transactions (Recommended)
+
 This wrapper automatically acquires a connection, begins the transaction, runs your logic, and commits (or rolls back on error).
 
 ```javascript
@@ -146,6 +147,7 @@ await insertMany(["Bob", "Charlie", "Dave"]);
 ```
 
 ### Manual Acquisition (Advanced)
+
 If you need granular control, you can acquire an exclusive session on the Writer.
 
 ```javascript
@@ -187,24 +189,83 @@ for await (const row of stmt.iterate()) {
 
 ---
 
-## 🔌 Legacy / TypeORM Adapter
+## 🔌 ORM Support (via SQLite3Adapter)
 
-If you are using **TypeORM**, **Sequelize**, or a library expecting the legacy `sqlite3` callback API, use the included adapter.
+This library includes a robust compatibility layer for ORMs that expect the legacy `node-sqlite3` callback API. This allows you to use `better-sqlite3-pool` as a drop-in replacement in existing projects.
+
+### Supported ORMs
+
+- **TypeORM**: Natively supported via the `"sqlite"` driver.
+- **Sequelize**: Supported as a `dialectModule`.
+- **MikroORM**: Supported via the `@mikro-orm/sqlite` package.
+- **Knex.js**: Supported via the `"sqlite3"` client.
+
+### Integration Examples
+
+#### TypeORM
 
 ```javascript
-// In TypeORM options
-const { Database, verbose } = require("better-sqlite3-pool/adapter");
+const adapter = require("better-sqlite3-pool/adapter");
 
 const dataSource = new DataSource({
   type: "sqlite",
   database: "test.db",
-  driver: {
-    Database: Database, // Pass the adapter class
-    verbose: verbose    // Optional
-  },
-  // ... other options
+  driver: adapter, // Pass the adapter module
+  // ...
 });
 ```
+
+#### Sequelize
+
+```javascript
+const adapter = require("better-sqlite3-pool/adapter");
+
+const sequelize = new Sequelize({
+  dialect: "sqlite",
+  storage: "test.db",
+  dialectModule: adapter, // Use as dialectModule
+});
+```
+
+#### MikroORM
+
+```javascript
+const adapter = require("better-sqlite3-pool/adapter");
+
+const db = await MikroORM.init({
+  type: 'sqlite',
+  dbName: 'test.db',
+  driver: adapter.Database, // Pass the Adapter class
+  // ...
+});
+```
+
+#### Knex.js
+
+```javascript
+const adapter = require("better-sqlite3-pool/adapter");
+
+const db = knex({
+  client: "sqlite3",
+  connection: { filename: "test.db" },
+  pool: { min: 2, max: 10 }
+});
+
+// Inject our adapter as the driver
+db.client.driver = adapter;
+```
+
+---
+
+## 🧪 Testing
+
+The library includes extensive integration tests for all supported ORMs. These tests are isolated into independent modules to ensure native compatibility.
+
+```bash
+npm run test:orm
+```
+
+See the [ORM Tests README](test/orm-tests/README.md) for more technical details on the testing infrastructure.
 
 ---
 
@@ -233,14 +294,14 @@ const db = await Database.create("file.db", {
 
 ## ⚠️ Limitations & Gotchas
 
-1.  **User Defined Functions (UDFs):**
-    *   Since functions run in a separate Worker thread, they **cannot close over variables** from your main thread. They must be "pure" or self-contained.
-    *   *Bad:* `let count = 0; db.function('fn', () => count++)` (Count stays 0 in main thread).
-    *   *Good:* `db.function('add', (a, b) => a + b)`
-2.  **In-Memory Databases:**
-    *   `:memory:` databases cannot be shared across threads. If you use one, the pool effectively becomes a single-threaded wrapper around the Writer.
-3.  **Host Parameters:**
-    *   Standard `better-sqlite3` allows binding standard JS objects. Since we pass data via `postMessage`, arguments must be **serializable** (no Functions, Promises, or Symbols as parameters).
+1. **User Defined Functions (UDFs):**
+   - Since functions run in a separate Worker thread, they **cannot close over variables** from your main thread. They must be "pure" or self-contained.
+   - *Bad:* `let count = 0; db.function('fn', () => count++)` (Count stays 0 in main thread).
+   - *Good:* `db.function('add', (a, b) => a + b)`
+2. **In-Memory Databases:**
+   - `:memory:` databases cannot be shared across threads. If you use one, the pool effectively becomes a single-threaded wrapper around the Writer.
+3. **Host Parameters:**
+   - Standard `better-sqlite3` allows binding standard JS objects. Since we pass data via `postMessage`, arguments must be **serializable** (no Functions, Promises, or Symbols as parameters).
 
 ## 📜 License
 

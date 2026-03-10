@@ -5,7 +5,7 @@
  * the thread-safety and performance benefits of the worker pool.
  */
 
-const { Database } = require("./lib/database");
+const Database = require("./index");
 
 // =============================================================================
 // TYPE DEFINITIONS
@@ -185,13 +185,72 @@ class SQLite3Adapter {
         complete = callback;
         callback = args.pop();
       }
-      if (args.length > 0) {
+
+      if (args.length === 1) {
         params = args[0];
-        if (!Array.isArray(params)) {
-          params = [params];
+      } else if (args.length > 1) {
+        params = args;
+      }
+    }
+
+    // 2. Normalization for Named and Positional Parameters
+    if (params && typeof params === "object" && !Array.isArray(params)) {
+      const keys = Object.keys(params);
+
+      // Check for strictly numeric keys (Legacy positional binding)
+      let isNumericPositional = keys.length > 0;
+      let maxIndex = 0;
+      for (const key of keys) {
+        if (!/^\d+$/.test(key)) {
+          isNumericPositional = false;
+          break;
+        }
+        maxIndex = Math.max(maxIndex, parseInt(key));
+      }
+
+      if (isNumericPositional) {
+        // Convert { '1': v, '2': v } to [v, v]
+        const arr = new Array(maxIndex);
+        for (const key of keys) {
+          arr[parseInt(key) - 1] = params[key];
+        }
+        params = arr;
+      } else {
+        // Check if any key already has a prefix (:, @, $)
+        const hasPrefix = keys.some((k) => /^[:@$]/.test(k));
+        if (!hasPrefix) {
+          // Standard sqlite3 behavior: { id: 1 } -> { ':id': 1 }
+          const normalized = {};
+          for (const key of keys) {
+            normalized[`:${key}`] = params[key];
+          }
+          params = normalized;
+        } else {
+          // If it already has prefixes (like Sequelize's $1, $2), we provide
+          // both the prefixed and base name as aliases for better-sqlite3 compatibility.
+          const normalized = {};
+          for (const key of keys) {
+            const val = params[key];
+            normalized[key] = val;
+            if (key.length > 1 && /^[:@$]/.test(key)) {
+              normalized[key.substring(1)] = val;
+            }
+          }
+          params = normalized;
         }
       }
     }
+
+    // 3. Final Wrap-up: Ensure params is always an array or object
+    if (params === null || params === undefined) {
+      params = [];
+    } else if (typeof params !== "object" && !Array.isArray(params)) {
+      params = [params];
+    } else if (Array.isArray(params)) {
+      // Filter out null/undefined placeholders (TypeORM compatibility)
+      params = params.filter((p) => p !== null && p !== undefined);
+    }
+
     return { params, callback, complete };
   }
 
@@ -315,13 +374,43 @@ class SQLite3Adapter {
       // The routing safety was already handled by the Scheduler above.
 
       if (method === "run") {
-        result = await executor.prepare(sql).run(...params);
+        result = await (Array.isArray(params)
+          ? executor.prepare(sql).run(...params)
+          : executor.prepare(sql).run(params));
       } else if (method === "all") {
-        result = await executor.prepare(sql).all(...params);
+        try {
+          result = await (Array.isArray(params)
+            ? executor.prepare(sql).all(...params)
+            : executor.prepare(sql).all(params));
+        } catch (err) {
+          if (err.message.includes("Use run() instead")) {
+            await (Array.isArray(params)
+              ? executor.prepare(sql).run(...params)
+              : executor.prepare(sql).run(params));
+            result = [];
+          } else {
+            throw err;
+          }
+        }
       } else if (method === "get") {
-        result = await executor.prepare(sql).get(...params);
+        try {
+          result = await (Array.isArray(params)
+            ? executor.prepare(sql).get(...params)
+            : executor.prepare(sql).get(params));
+        } catch (err) {
+          if (err.message.includes("Use run() instead")) {
+            await (Array.isArray(params)
+              ? executor.prepare(sql).run(...params)
+              : executor.prepare(sql).run(params));
+            result = undefined;
+          } else {
+            throw err;
+          }
+        }
       } else if (method === "each") {
-        const iter = executor.prepare(sql).iterate(...params);
+        const iter = Array.isArray(params)
+          ? executor.prepare(sql).iterate(...params)
+          : executor.prepare(sql).iterate(params);
         let count = 0;
         for await (const row of iter) {
           count++;
@@ -342,18 +431,34 @@ class SQLite3Adapter {
         }
       }
 
-      // 5. Callback
+      // 5. Callback & Metadata mapping
       if (cb) {
-        const ctx = {};
-        if (result && method === "run") {
-          ctx.lastID = result.lastInsertRowid;
-          ctx.changes = result.changes;
+        const lastID =
+          result && result.lastInsertRowid !== undefined
+            ? result.lastInsertRowid
+            : undefined;
+        const changes =
+          result && result.changes !== undefined ? result.changes : 0;
+
+        const ctx = { lastID, changes };
+
+        // for .all() and .get(), we ensure result is exactly what better-sqlite3 would return
+        // for .run(), we return the info object
+        let data =
+          method === "run"
+            ? { lastID, lastInsertRowid: lastID, changes }
+            : result;
+
+        // Legacy drivers expect an empty array if no rows are found
+        if (method === "all" && !Array.isArray(data)) {
+          data = [];
         }
-        const data = method === "run" ? null : result;
+
         cb.call(ctx, null, data);
       }
     } catch (err) {
       if (cb) cb(err);
+      if (complete) complete();
 
       // Critical Cleanup
       if (this.conn) {

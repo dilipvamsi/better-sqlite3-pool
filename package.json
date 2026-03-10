@@ -1,12 +1,14 @@
 {
   "name": "better-sqlite3-pool",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "A non-blocking, multi-threaded, auto-scaling SQLite connection pool with encryption support.",
   "main": "./src/index.js",
   "types": "./src/index.d.ts",
   "scripts": {
     "test": "mocha --exit --slow=75 --timeout=30000",
-    "test:file": "mocha --exit --slow=75 --timeout=30000 test/00.setup.js"
+    "test:file": "mocha --exit --slow=75 --timeout=30000 test/00.setup.js",
+    "test:orm": "for d in test/orm-tests/*/; do (cd \"$d\" && npm test); done",
+    "test:coverage": "nyc npm run test"
   },
   "files": [
     "src/",
@@ -33,15 +35,29 @@
   "author": "dilipvamsi",
   "license": "MIT",
   "dependencies": {
-    "better-sqlite3-multiple-ciphers": "^12.5.0"
+    "better-sqlite3-multiple-ciphers": "^12.6.2"
   },
   "devDependencies": {
     "chai": "^6.2.2",
     "fs-extra": "^11.3.3",
-    "mocha": "^11.7.5"
+    "mocha": "^11.3.0",
+    "nyc": "^18.0.0"
+  },
+  "overrides": {
+    "serialize-javascript": "^7.0.4"
   },
   "repository": {
     "type": "git",
     "url": "https://github.com/dilipvamsi/better-sqlite3-pool"
+  },
+  "nyc": {
+    "include": [
+      "src/**/*.js"
+    ],
+    "reporter": [
+      "text",
+      "html"
+    ],
+    "all": true
   }
 }

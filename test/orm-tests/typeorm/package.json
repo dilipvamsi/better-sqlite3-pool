@@ -1,0 +1,13 @@
+{
+  "name": "orm-test-typeorm",
+  "private": true,
+  "scripts": {
+    "test": "mocha typeorm.test.js --exit"
+  },
+  "devDependencies": {
+    "typeorm": "^0.3.28",
+    "reflect-metadata": "^0.2.2",
+    "mocha": "^11.3.0",
+    "chai": "^6.2.2"
+  }
+}

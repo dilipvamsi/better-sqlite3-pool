@@ -1,0 +1,12 @@
+{
+  "name": "orm-test-sequelize",
+  "private": true,
+  "scripts": {
+    "test": "mocha sequelize.test.js --exit"
+  },
+  "devDependencies": {
+    "sequelize": "^6.37.8",
+    "mocha": "^11.3.0",
+    "chai": "^6.2.2"
+  }
+}
