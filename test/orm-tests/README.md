@@ -27,15 +27,20 @@ Each subdirectory contains its own `package.json` and local `node_modules`.
 3. **Adapter vs. Direct Pool**:
    - **Adapter (`adapter.Database`)**: Mimics the **callback-based** `sqlite3` API. Required for legacy-style ORMs like Sequelize and TypeORM.
    - **Pool (`Database`)**: Provides a **Promise-based** API. Modern synchronous drivers (like some better-sqlite3 drivers) are NOT compatible with the async pool directly.
+1.  **Dependency Isolation**: ORMs often have large dependency trees. Keeping them separate avoids version conflicts and a bloated root `package.json`.
+2.  **Native Verification**: Tests confirm that each ORM works with our `SQLite3Adapter` using its standard `sqlite3` driver/dialect settings.
+3.  **Adapter vs. Direct Pool**:
+    -   **Adapter (`adapter.Database`)**: Mimics the **callback-based** `sqlite3` API. Required for legacy-style ORMs like Sequelize and TypeORM.
+    -   **Pool (`Database`)**: Provides a **Promise-based** API. Modern synchronous drivers (like some better-sqlite3 drivers) are NOT compatible with the async pool directly.
 
-**Conclusion**: Use the **Adapter** for ORMs that support the standard `sqlite3` driver interface.
+**Conclusion**: Use the **Adapter** for ORMs that support the standard `sqlite3` driver interface. This is officially supported via the `better-sqlite3-pool/adapter` subpath export or directly via the `adapter` property on the main package.
 
 ## Configuration Examples
 
 ### TypeORM
 
 ```javascript
-const adapter = require('better-sqlite3-pool/adapter');
+const { adapter } = require('better-sqlite3-pool');
 const dataSource = new DataSource({
   type: "sqlite",
   database: "path/to/db",
@@ -48,7 +53,7 @@ const dataSource = new DataSource({
 ### Sequelize
 
 ```javascript
-const adapter = require('better-sqlite3-pool/adapter');
+const { adapter } = require('better-sqlite3-pool');
 const sequelize = new Sequelize({
   dialect: "sqlite",
   storage: "path/to/db",
@@ -59,7 +64,7 @@ const sequelize = new Sequelize({
 ### MikroORM
 
 ```javascript
-const adapter = require('better-sqlite3-pool/adapter');
+const { adapter } = require('better-sqlite3-pool');
 const db = await MikroORM.init({
   type: 'sqlite',
   dbName: 'path/to/db',

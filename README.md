@@ -21,7 +21,8 @@ The standard `better-sqlite3` is the fastest driver available, but it is **synch
 - **📈 Auto-Scaling:** Spawns more Reader Workers automatically as load increases.
 - **💾 WAL-Safe Encryption:** Smart handling of Journal Modes to prevent header corruption on encrypted files.
 - **❤️ Transaction Heartbeats:** Auto-rollbacks stalled transactions to prevent "database locked" deadlocks.
-- **🔌 SQLite3 Adapter:** Drop-in compatibility mode for legacy libraries.
+- **🔌 SQLite3 Adapter:** Drop-in compatibility mode for legacy libraries via `better-sqlite3-pool/adapter`.
+- **🏷️ Better TypeScript Support:** Improved type definitions for both the main pool and the adapter.
 
 ---
 
@@ -198,19 +199,22 @@ This library includes a robust compatibility layer for ORMs that expect the lega
 - **TypeORM**: Natively supported via the `"sqlite"` driver.
 - **Sequelize**: Supported as a `dialectModule`.
 - **MikroORM**: Supported via the `@mikro-orm/sqlite` package.
-- **Knex.js**: Supported via the `"sqlite3"` client.
+-   **TypeORM**: Natively supported via the `"sqlite"` driver.
+-   **Sequelize**: Supported as a `dialectModule`.
+-   **MikroORM**: Supported via the `@mikro-orm/sqlite` package.
+-   **Knex.js**: Supported via the `"sqlite3"` client.
 
 ### Integration Examples
 
 #### TypeORM
 
 ```javascript
-const adapter = require("better-sqlite3-pool/adapter");
+const { adapter } = require("better-sqlite3-pool");
 
 const dataSource = new DataSource({
   type: "sqlite",
   database: "test.db",
-  driver: adapter, // Pass the adapter module
+  driver: adapter, // Pass the adapter object
   // ...
 });
 ```
@@ -218,7 +222,7 @@ const dataSource = new DataSource({
 #### Sequelize
 
 ```javascript
-const adapter = require("better-sqlite3-pool/adapter");
+const { adapter } = require("better-sqlite3-pool");
 
 const sequelize = new Sequelize({
   dialect: "sqlite",
@@ -230,7 +234,7 @@ const sequelize = new Sequelize({
 #### MikroORM
 
 ```javascript
-const adapter = require("better-sqlite3-pool/adapter");
+const { adapter } = require("better-sqlite3-pool");
 
 const db = await MikroORM.init({
   type: 'sqlite',
@@ -243,7 +247,7 @@ const db = await MikroORM.init({
 #### Knex.js
 
 ```javascript
-const adapter = require("better-sqlite3-pool/adapter");
+const { adapter } = require("better-sqlite3-pool");
 
 const db = knex({
   client: "sqlite3",

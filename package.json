@@ -1,13 +1,25 @@
 {
   "name": "better-sqlite3-pool",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "A non-blocking, multi-threaded, auto-scaling SQLite connection pool with encryption support.",
   "main": "./src/index.js",
   "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js",
+      "require": "./src/index.js"
+    },
+    "./adapter": {
+      "types": "./src/adapter.d.ts",
+      "import": "./src/adapter.js",
+      "require": "./src/adapter.js"
+    }
+  },
   "scripts": {
     "test": "mocha --exit --slow=75 --timeout=30000",
     "test:file": "mocha --exit --slow=75 --timeout=30000 test/00.setup.js",
-    "test:orm": "for d in test/orm-tests/*/; do (cd \"$d\" && npm test); done",
+    "test:orm": "for d in test/orm-tests/*/; do (cd \"$d\" && npm install && npm test); done",
     "test:coverage": "nyc npm run test"
   },
   "files": [
@@ -38,6 +50,7 @@
     "better-sqlite3-multiple-ciphers": "^12.6.2"
   },
   "devDependencies": {
+    "@types/node": "^25.4.0",
     "chai": "^6.2.2",
     "fs-extra": "^11.3.3",
     "mocha": "^11.3.0",

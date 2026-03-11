@@ -7,8 +7,11 @@
   "devDependencies": {
     "@mikro-orm/core": "^6.6.9",
     "@mikro-orm/sqlite": "^6.6.9",
-    "reflect-metadata": "^0.2.2",
+    "chai": "^6.2.2",
     "mocha": "^11.3.0",
-    "chai": "^6.2.2"
+    "reflect-metadata": "^0.2.2"
+  },
+  "dependencies": {
+    "better-sqlite3-pool": "file:../../.."
   }
 }

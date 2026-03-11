@@ -3,7 +3,7 @@ const { DataSource, EntitySchema } = require("typeorm");
 const { expect } = require("chai");
 const path = require("path");
 const fs = require("fs");
-const adapter = require("../../../src/adapter");
+const { adapter } = require("better-sqlite3-pool");
 
 // --- Entities using EntitySchema (for ES compatibility without decorators) ---
 

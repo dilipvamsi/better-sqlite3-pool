@@ -2,7 +2,7 @@ const expect = require("chai").expect;
 const path = require("path");
 const fs = require("fs");
 const knex = require("knex");
-const adapter = require("../../../src/adapter");
+const { adapter } = require("better-sqlite3-pool");
 
 describe("Knex.js Integration via SQLite3Adapter", function () {
   this.timeout(30000);

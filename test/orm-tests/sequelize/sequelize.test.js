@@ -2,7 +2,7 @@ const { Sequelize, DataTypes } = require("sequelize");
 const { expect } = require("chai");
 const path = require("path");
 const fs = require("fs");
-const adapter = require("../../../src/adapter");
+const { adapter } = require("better-sqlite3-pool");
 
 describe("Sequelize Integration via SQLite3Adapter", function () {
   this.timeout(30000);

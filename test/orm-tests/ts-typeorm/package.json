@@ -1,0 +1,22 @@
+{
+  "name": "orm-test-ts-typeorm",
+  "private": true,
+  "scripts": {
+    "test": "cross-env NODE_OPTIONS=--no-experimental-strip-types mocha -r ts-node/register ts-typeorm.test.ts --exit"
+  },
+  "devDependencies": {
+    "typeorm": "^0.3.28",
+    "reflect-metadata": "^0.2.2",
+    "mocha": "^11.3.0",
+    "cross-env": "^7.0.3",
+    "chai": "^4.5.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3",
+    "@types/node": "^20.17.19",
+    "@types/mocha": "^10.0.10",
+    "@types/chai": "^4.3.20"
+  },
+  "dependencies": {
+    "better-sqlite3-pool": "file:../../.."
+  }
+}

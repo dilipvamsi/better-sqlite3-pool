@@ -18,4 +18,11 @@ Database.Statement = Statement;
 // 3. Expose Connection class
 Database.Connection = Connection;
 
+// 4. Expose Database on itself for named imports in TypeScript/ESM
+Database.Database = Database;
+
 module.exports = Database;
+
+// 5. Expose Adapter for direct access
+// We require the adapter *after* module.exports is set to avoid circular issues
+Database.adapter = require("./adapter");
