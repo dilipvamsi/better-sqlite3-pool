@@ -20,7 +20,8 @@
     "test": "mocha --exit --slow=75 --timeout=30000",
     "test:file": "mocha --exit --slow=75 --timeout=30000 test/00.setup.js",
     "test:orm": "for d in test/orm-tests/*/; do (cd \"$d\" && npm install && npm test); done",
-    "test:coverage": "nyc npm run test"
+    "test:coverage": "nyc npm run test",
+    "external-test": "node scripts/external-test.js"
   },
   "files": [
     "src/",

@@ -4,6 +4,9 @@ A **non-blocking**, **multi-threaded**, **auto-scaling** SQLite connection pool 
 
 Designed for high-concurrency Node.js applications (like REST APIs or GraphQL servers) that need the speed of SQLite and the security of **SQLCipher encryption** without blocking the main event loop.
 
+> [!IMPORTANT]
+> **Production Ready:** Nearly 100% of the original `better-sqlite3` test suite has been ported and is fully covered to ensure maximum reliability and behavioral parity.
+
 ## 🚀 Why this exists?
 
 The standard `better-sqlite3` is the fastest driver available, but it is **synchronous**.

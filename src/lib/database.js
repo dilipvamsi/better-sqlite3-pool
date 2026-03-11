@@ -89,7 +89,9 @@ class Database extends EventEmitter {
     options.exists = exists;
 
     // Instantiate with internal token
-    const db = new this(filename, options, kInternal);
+    // We use 'this' to support subclassing, falling back to Database if called as a namespace
+    const Ctor = typeof this === "function" ? this : Database;
+    const db = new Ctor(filename, options, kInternal);
 
     try {
       await db._init();
